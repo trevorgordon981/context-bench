@@ -117,6 +117,15 @@ What you're looking for in the summary table:
   <15% throughput drop from baseline and no swap pressure, as a starting point
   for production configuration.
 
+## Related projects
+
+Part of a self-hosted LLM operations toolkit:
+
+- [blockops-proxy](https://github.com/trevorgordon981/blockops-proxy) — the proxy layer whose MAX_CONCURRENT and context thresholds this benchmark helps tune
+- [llm-otel-proxy](https://github.com/trevorgordon981/llm-otel-proxy) — metrics proxy that tracks the exact same tokens/latency dimensions in production
+- [alfred-infra](https://github.com/trevorgordon981/alfred-infra) — dashboards/monitoring for the infrastructure this benchmark characterizes
+- [alfred-rag](https://github.com/trevorgordon981/alfred-rag) — RAG stack that benefits from knowing the safe operating context range
+
 ## License
 
 MIT. See [LICENSE](LICENSE).
