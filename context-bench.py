@@ -58,6 +58,15 @@ FILLER_BLOCK = (
 # ~130 words per block, roughly 170 tokens. We'll estimate 3.5 chars/token.
 CHARS_PER_TOKEN = 3.5
 
+# Extra chat-template arguments, forwarded verbatim as `chat_template_kwargs`.
+# Reasoning models gate their think phase on a MODEL-SPECIFIC key with a
+# MODEL-SPECIFIC default -- there is no portable switch:
+#   DeepSeek / Qwen : {"enable_thinking": true|false}   default OFF
+#   MiniMax         : {"thinking_mode": true|false}     default ON
+# Benchmarking without pinning this compares a thinking run against a non-thinking
+# one and calls the difference throughput. Empty dict = server default.
+THINK_KWARGS = {}
+
 
 def get_memory_pressure():
     """Parse macOS memory_pressure output."""
@@ -108,17 +117,51 @@ def build_prompt(target_tokens):
 
 
 def run_single_test(messages, ctx_label, model_name=None):
-    """Send a streaming request, measure TTFT and throughput."""
+    """Send a streaming request and measure prefill/decode behaviour.
+
+    REASONING MODELS (2026-08-19). Servers emit chain-of-thought on a SEPARATE
+    delta field -- `reasoning` or `reasoning_content` -- not on `content`. An
+    earlier version of this function counted only `content`, which silently broke
+    three metrics at once on any reasoning model:
+
+      * output_tokens undercounted by however much the model thought;
+      * tokens_per_sec computed over that undercount, so decode throughput read
+        far lower than reality;
+      * TTFT -- worst of the three -- fired on the first CONTENT token, so the
+        entire think phase was billed as prefill latency.
+
+    Measured on deepseek-v4-flash: reasoning_len 9359 vs content_len 537, i.e.
+    ~95% of generated tokens were invisible, and TTFT read ~90s instead of ~1s.
+
+    So: TTFT is now the first token of EITHER kind (true prefill), `ttft_content_s`
+    is reported alongside it for the answer-latency question, and reasoning and
+    content tokens are counted separately.
+
+    Token counts prefer the server's own `usage` block (via stream_options) and
+    fall back to counting SSE chunks only when the server does not send one.
+    `finish_reason` is captured because a run truncated at max_tokens is not
+    comparable to one that stopped on its own.
+    """
     body = {
         "model": model_name or MODEL_NAME,
         "messages": messages,
         "max_tokens": OUTPUT_TOKENS,
         "stream": True,
         "temperature": 0.7,
+        # Ask for the exact token accounting. Servers that don't support it ignore it.
+        "stream_options": {"include_usage": True},
     }
+    if THINK_KWARGS:
+        body["chat_template_kwargs"] = dict(THINK_KWARGS)
 
-    output_tokens = 0
-    first_token_time = None
+    content_chunks = 0
+    reasoning_chunks = 0
+    content_chars = 0
+    reasoning_chars = 0
+    first_any_time = None
+    first_content_time = None
+    finish_reason = None
+    usage = None
     start = time.monotonic()
 
     try:
@@ -138,14 +181,34 @@ def run_single_test(messages, ctx_label, model_name=None):
                         break
                     try:
                         chunk = json.loads(data)
-                        delta = chunk["choices"][0].get("delta", {})
-                        content = delta.get("content", "")
-                        if content and first_token_time is None:
-                            first_token_time = time.monotonic()
-                        if content:
-                            output_tokens += 1  # approximate: 1 SSE chunk ≈ 1 token
-                    except (json.JSONDecodeError, KeyError, IndexError):
+                    except json.JSONDecodeError:
                         continue
+
+                    if chunk.get("usage"):
+                        usage = chunk["usage"]
+
+                    choices = chunk.get("choices") or []
+                    if not choices:
+                        continue           # usage-only frame carries no choices
+                    choice = choices[0]
+                    if choice.get("finish_reason"):
+                        finish_reason = choice["finish_reason"]
+                    delta = choice.get("delta") or {}
+
+                    # Vendors disagree on the field name; accept both.
+                    think = delta.get("reasoning") or delta.get("reasoning_content") or ""
+                    content = delta.get("content") or ""
+
+                    if (think or content) and first_any_time is None:
+                        first_any_time = time.monotonic()
+                    if think:
+                        reasoning_chunks += 1
+                        reasoning_chars += len(think)
+                    if content:
+                        if first_content_time is None:
+                            first_content_time = time.monotonic()
+                        content_chunks += 1
+                        content_chars += len(content)
 
     except httpx.TimeoutException:
         return {"error": f"Timeout after {TIMEOUT_S}s"}
@@ -154,17 +217,38 @@ def run_single_test(messages, ctx_label, model_name=None):
 
     end = time.monotonic()
     total_time = end - start
-    ttft = (first_token_time - start) if first_token_time else total_time
-    decode_time = (end - first_token_time) if first_token_time else 0
+    ttft = (first_any_time - start) if first_any_time else total_time
+    decode_time = (end - first_any_time) if first_any_time else 0
+
+    # Server-reported counts are authoritative; chunk counts are the fallback.
+    chunk_total = content_chunks + reasoning_chunks
+    output_tokens = (usage or {}).get("completion_tokens") or chunk_total
     tps = output_tokens / decode_time if decode_time > 0 else 0
 
-    return {
+    out = {
         "ttft_s": round(ttft, 2),
         "total_s": round(total_time, 2),
         "output_tokens": output_tokens,
         "tokens_per_sec": round(tps, 2),
         "decode_time_s": round(decode_time, 2),
+        # reasoning-model visibility
+        "reasoning_chars": reasoning_chars,
+        "content_chars": content_chars,
+        "reasoned": reasoning_chars > 0,
+        "token_source": "usage" if (usage or {}).get("completion_tokens") else "sse_chunks",
+        "finish_reason": finish_reason,
+        # a run cut off at max_tokens is not comparable to one that stopped itself
+        "truncated": finish_reason == "length",
+        "think_kwargs": dict(THINK_KWARGS) or None,
     }
+    if first_content_time:
+        out["ttft_content_s"] = round(first_content_time - start, 2)
+    if reasoning_chars and (reasoning_chars + content_chars):
+        out["reasoning_share"] = round(
+            reasoning_chars / (reasoning_chars + content_chars), 3)
+    if usage:
+        out["usage_prompt_tokens"] = usage.get("prompt_tokens")
+    return out
 
 
 def run_benchmark(api_url, iterations, context_sizes, model_name, results_file):
@@ -212,12 +296,19 @@ def run_benchmark(api_url, iterations, context_sizes, model_name, results_file):
             if "error" in result:
                 print(f"FAILED: {result['error']}")
             else:
+                _think = ""
+                if result.get("reasoned"):
+                    _think = f"  think={result.get('reasoning_share', 0):.0%}"
+                    if result.get("ttft_content_s"):
+                        _think += f" (ttft_content={result['ttft_content_s']:.1f}s)"
+                _trunc = "  TRUNCATED" if result.get("truncated") else ""
                 print(
                     f"TTFT={result['ttft_s']:.1f}s  "
                     f"TPS={result['tokens_per_sec']:.1f}  "
                     f"total={result['total_s']:.1f}s  "
                     f"pageouts={pageouts_delta}  "
                     f"mem_free={mem_free_after}%"
+                    f"{_think}{_trunc}"
                 )
 
             iter_results.append(result)
@@ -347,7 +438,37 @@ if __name__ == "__main__":
         default=str(RESULTS_FILE),
         help=f"Path to write JSON results (default: {RESULTS_FILE})",
     )
+    parser.add_argument(
+        "--think",
+        choices=["on", "off"],
+        default=None,
+        help="Force the model's reasoning phase on or off. Sends the right "
+             "chat_template_kwargs key for --think-style. Omit to use the server default "
+             "(which DIFFERS per model: DeepSeek/Qwen default off, MiniMax defaults on).",
+    )
+    parser.add_argument(
+        "--think-style",
+        choices=["deepseek", "qwen", "minimax"],
+        default="deepseek",
+        help="Which vendor key --think should set: deepseek/qwen -> enable_thinking, "
+             "minimax -> thinking_mode (default: deepseek)",
+    )
+    parser.add_argument(
+        "--think-kwargs",
+        type=str,
+        default=None,
+        help="Raw JSON forwarded as chat_template_kwargs, e.g. "
+             "'{\"enable_thinking\": true}'. Overrides --think/--think-style.",
+    )
     args = parser.parse_args()
+
+    if args.think_kwargs:
+        THINK_KWARGS = json.loads(args.think_kwargs)
+    elif args.think is not None:
+        _key = "thinking_mode" if args.think_style == "minimax" else "enable_thinking"
+        THINK_KWARGS = {_key: args.think == "on"}
+    if THINK_KWARGS:
+        print(f"chat_template_kwargs: {THINK_KWARGS}")
 
     sizes = CONTEXT_SIZES
     if args.sizes:

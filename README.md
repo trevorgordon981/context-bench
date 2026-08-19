@@ -20,6 +20,63 @@ The tool is most useful before putting a new model deployment into production:
 run it once to learn where throughput drops off a cliff and where the OS starts
 swapping, then set your serving layer's `max_context` accordingly.
 
+## Reasoning models
+
+Servers stream chain-of-thought on a **separate delta field** — `reasoning` or
+`reasoning_content` — not on `content`. A benchmark that counts only `content`
+silently breaks three metrics at once on any reasoning model:
+
+- **`output_tokens`** undercounts by however much the model thought
+- **`tokens_per_sec`** is computed over that undercount, so decode throughput
+  reads far lower than it actually is
+- **TTFT** — the worst of the three — fires on the first *content* token, so the
+  entire thinking phase gets billed as prefill latency
+
+Measured on `deepseek-v4-flash` at 4k context: `reasoning_len 9359` vs
+`content_len 537`. About 95% of generated tokens were invisible to a content-only
+counter, and TTFT read ~90s instead of ~1s.
+
+This tool therefore reports **TTFT as the first token of either kind** (true
+prefill), with `ttft_content_s` alongside it for the answer-latency question, and
+counts reasoning and content separately (`reasoning_chars`, `content_chars`,
+`reasoning_share`).
+
+### Pinning the thinking mode
+
+There is **no portable switch** for reasoning. The key *and its default* are
+vendor-specific:
+
+| family          | `chat_template_kwargs` key | default |
+|-----------------|----------------------------|---------|
+| DeepSeek, Qwen  | `enable_thinking`          | off     |
+| MiniMax         | `thinking_mode`            | on      |
+
+Benchmarking without pinning it compares a thinking run against a non-thinking one
+and calls the difference throughput. Use:
+
+```bash
+# force reasoning ON for a DeepSeek/Qwen endpoint
+./context-bench.py --think on --think-style deepseek
+
+# force it OFF for MiniMax
+./context-bench.py --think off --think-style minimax
+
+# or pass the kwargs verbatim
+./context-bench.py --think-kwargs '{"enable_thinking": true}'
+```
+
+The kwargs actually sent are recorded on every result row as `think_kwargs`, so a
+results file always says which mode produced it.
+
+### Token counts and truncation
+
+Counts come from the server's own `usage` block where available (requested via
+`stream_options.include_usage`); `token_source` reports `usage` or `sse_chunks` so
+you know whether a number is exact or estimated. `finish_reason` is recorded, and
+`truncated` flags any run cut off at `max_tokens` — a truncated run is not
+comparable to one that stopped on its own, and at large context sizes truncation
+becomes common enough to distort an average silently.
+
 ## Design
 
 The benchmark constructs prompts by repeating a fixed **filler block** of generic
