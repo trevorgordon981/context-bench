@@ -128,7 +128,12 @@ match).
 
 ## Expected Output
 
-A console summary table plus a JSON report with these fields:
+A console summary table plus a JSON report with the fields below.
+
+**The numbers in this block are illustrative placeholders, not measurements.**
+They exist to show the shape of the report. Do not cite them as results for any
+model or machine. Real figures depend entirely on the model, the quantisation,
+the serving engine, and the hardware.
 
 ```json
 {
@@ -143,9 +148,9 @@ A console summary table plus a JSON report with these fields:
   "summary": {
     "4K": {
       "context_size": 4096,
-      "avg_ttft_s": 0.42,
-      "avg_tps": 58.3,
-      "avg_total_s": 9.1,
+      "avg_ttft_s": 0.42,          // placeholder value
+      "avg_tps": 58.3,            // placeholder value
+      "avg_total_s": 9.1,         // placeholder value
       "avg_pageouts": 0,
       "failures": 0,
       "runs": 3
@@ -155,6 +160,25 @@ A console summary table plus a JSON report with these fields:
   "raw": [ /* per-iteration records */ ]
 }
 ```
+
+<!-- TODO(trevor): no real measured sweep is published here yet.
+     Probed 2026-10-08: 127.0.0.1:8090 was not listening on the laptop or on
+     bat-studio (8082/8090 both refused; 8091/8095 answered 401, those are the
+     gateway). Once the MLX endpoint is back up, run:
+         python context-bench.py --sizes 4,16,32,64,120 --iterations 3 \
+             --model <served-model-id> --results-file results-macstudio.json
+     then add a "Measured results" section naming the hardware (Mac Studio
+     M3 Ultra 512GB) and the exact model and quantisation. Note the caveat
+     below about avg_tps before publishing any number from it. -->
+
+<!-- CAVEAT(trevor): avg_tps is computed as output_tokens / (total_s - ttft_s)
+     at context-bench.py:226. If the server buffers the whole completion into
+     one chunk instead of streaming, ttft_s collapses onto total_s, the
+     denominator goes to ~0, and avg_tps explodes. That is exactly what
+     alfred-infra/context-bench-results.json shows: avg_total_s minus
+     avg_ttft_s is 0.02s on every row, and avg_tps reads ~11,000 on a Mac
+     Studio, which is not a real decode rate. Confirm the run actually
+     streamed before trusting avg_tps. -->
 
 ## Interpretation
 
