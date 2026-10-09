@@ -223,13 +223,21 @@ def run_single_test(messages, ctx_label, model_name=None):
     # Server-reported counts are authoritative; chunk counts are the fallback.
     chunk_total = content_chunks + reasoning_chunks
     output_tokens = (usage or {}).get("completion_tokens") or chunk_total
-    tps = output_tokens / decode_time if decode_time > 0 else 0
+
+    # A server that buffers the whole completion into a single SSE frame
+    # collapses first_any_time onto `end`. decode_time then goes to ~0 and
+    # output_tokens/decode_time explodes into a number that looks like a
+    # spectacular throughput result and is really a division artifact.
+    # One frame is not a decode curve, so refuse to report a rate at all.
+    streamed = chunk_total > 1
+    tps = output_tokens / decode_time if (streamed and decode_time > 0) else None
 
     out = {
         "ttft_s": round(ttft, 2),
         "total_s": round(total_time, 2),
         "output_tokens": output_tokens,
-        "tokens_per_sec": round(tps, 2),
+        "tokens_per_sec": round(tps, 2) if tps is not None else None,
+        "streamed": streamed,
         "decode_time_s": round(decode_time, 2),
         # reasoning-model visibility
         "reasoning_chars": reasoning_chars,
@@ -302,9 +310,11 @@ def run_benchmark(api_url, iterations, context_sizes, model_name, results_file):
                     if result.get("ttft_content_s"):
                         _think += f" (ttft_content={result['ttft_content_s']:.1f}s)"
                 _trunc = "  TRUNCATED" if result.get("truncated") else ""
+                _tps = result["tokens_per_sec"]
+                _tps_s = f"{_tps:.1f}" if _tps is not None else "n/a (not streamed)"
                 print(
                     f"TTFT={result['ttft_s']:.1f}s  "
-                    f"TPS={result['tokens_per_sec']:.1f}  "
+                    f"TPS={_tps_s}  "
                     f"total={result['total_s']:.1f}s  "
                     f"pageouts={pageouts_delta}  "
                     f"mem_free={mem_free_after}%"
@@ -320,9 +330,13 @@ def run_benchmark(api_url, iterations, context_sizes, model_name, results_file):
             results[ctx_label] = {
                 "context_size": ctx_size,
                 "avg_ttft_s": round(sum(r["ttft_s"] for r in good) / len(good), 2),
-                "avg_tps": round(
-                    sum(r["tokens_per_sec"] for r in good) / len(good), 2
+                "avg_tps": (
+                    round(sum(_m) / len(_m), 2)
+                    if (_m := [r["tokens_per_sec"] for r in good
+                               if r.get("tokens_per_sec") is not None])
+                    else None
                 ),
+                "tps_measurable": any(r.get("streamed") for r in good),
                 "avg_total_s": round(
                     sum(r["total_s"] for r in good) / len(good), 2
                 ),
@@ -337,6 +351,7 @@ def run_benchmark(api_url, iterations, context_sizes, model_name, results_file):
                 "context_size": ctx_size,
                 "avg_ttft_s": None,
                 "avg_tps": None,
+                "tps_measurable": False,
                 "avg_total_s": None,
                 "avg_pageouts": None,
                 "failures": len(iter_results),
@@ -372,10 +387,23 @@ def run_benchmark(api_url, iterations, context_sizes, model_name, results_file):
 
     baseline_tps = None
     recommended = None
+    unmeasurable = False
 
     for label, data in results.items():
         if data["runs"] == 0:
             print(f"  {label:>8}  {'—':>8}  {'—':>8}  {'—':>8}  {'—':>9}  {'FAIL':>8}")
+            continue
+
+        if data["avg_tps"] is None:
+            # Server never streamed, so there is no decode rate to compare.
+            # Fall back to TTFT and swap pressure and say so.
+            unmeasurable = True
+            status = "SWAP" if data["avg_pageouts"] > 100 else "no TPS"
+            print(
+                f"  {label:>8}  {data['avg_ttft_s']:>7.1f}s  "
+                f"{'n/a':>8}  {data['avg_total_s']:>7.1f}s  "
+                f"{data['avg_pageouts']:>8.0f}  {status:>8}"
+            )
             continue
 
         if baseline_tps is None:
@@ -384,8 +412,6 @@ def run_benchmark(api_url, iterations, context_sizes, model_name, results_file):
         tps_drop = (
             (1 - data["avg_tps"] / baseline_tps) * 100 if baseline_tps else 0
         )
-        swap_flag = "SWAP" if data["avg_pageouts"] > 100 else ""
-        drop_flag = f"-{tps_drop:.0f}%" if tps_drop > 0 else "base"
 
         status = "OK"
         if data["avg_pageouts"] > 100:
@@ -405,13 +431,27 @@ def run_benchmark(api_url, iterations, context_sizes, model_name, results_file):
 
     # Recommendation
     print()
-    if recommended:
+    if unmeasurable:
+        print("  THROUGHPUT NOT MEASURED")
+        print(
+            "  At least one size returned the whole completion in a single frame,"
+        )
+        print(
+            "  so there is no decode window to divide by and no tokens/sec to"
+        )
+        print(
+            "  report. Check that the endpoint honours stream=true before citing"
+        )
+        print(
+            "  any number from this run. TTFT and pageouts above are still valid."
+        )
+    elif recommended:
         print(f"  RECOMMENDATION: {recommended} context window")
         print(
             f"  Highest size with <15% throughput drop and no swap pressure."
         )
     else:
-        print("  RECOMMENDATION: Stay at 4K — all larger sizes showed degradation.")
+        print("  RECOMMENDATION: Stay at 4K, all larger sizes showed degradation.")
     print()
 
 

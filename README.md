@@ -152,6 +152,7 @@ the serving engine, and the hardware.
       "avg_tps": 58.3,            // placeholder value
       "avg_total_s": 9.1,         // placeholder value
       "avg_pageouts": 0,
+      "tps_measurable": true,
       "failures": 0,
       "runs": 3
     },
@@ -192,6 +193,11 @@ What you're looking for in the summary table:
     the working set no longer fits in RAM and the OS is paging.
   - **Prefill saturation** — the model's attention kernels are falling off a
     hardware-friendly tile size, or the KV cache is crossing a buffer boundary.
+- **`avg_tps: null` and a "no TPS" status** — the endpoint returned the whole
+  completion in one frame instead of streaming it. There is no decode window to
+  divide by, so no throughput number is reported rather than a fabricated one.
+  Check that your server honours `stream: true`. TTFT and pageouts are still
+  valid in this case.
 - **Failures at large sizes** — the serving layer is rejecting prompts above
   some configured `max_context`. Check your server logs.
 - **Recommendation line** — the tool prints the largest tested size with
