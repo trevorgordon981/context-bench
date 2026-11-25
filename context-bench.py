@@ -162,6 +162,7 @@ def run_single_test(messages, ctx_label, model_name=None):
     first_content_time = None
     finish_reason = None
     usage = None
+    saw_done = False
     start = time.monotonic()
 
     try:
@@ -174,10 +175,11 @@ def run_single_test(messages, ctx_label, model_name=None):
                     return {"error": f"HTTP {resp.status_code}: {error_body[:200]}"}
 
                 for line in resp.iter_lines():
-                    if not line.startswith("data: "):
+                    if not line.startswith("data:"):
                         continue
-                    data = line[6:]
+                    data = line[5:].strip()
                     if data == "[DONE]":
+                        saw_done = True
                         break
                     try:
                         chunk = json.loads(data)
@@ -224,6 +226,7 @@ def run_single_test(messages, ctx_label, model_name=None):
     chunk_total = content_chunks + reasoning_chunks
     output_tokens = (usage or {}).get("completion_tokens") or chunk_total
     tps = output_tokens / decode_time if decode_time > 0 else 0
+    stream_completed = saw_done or (finish_reason is not None)
 
     out = {
         "ttft_s": round(ttft, 2),
@@ -237,10 +240,12 @@ def run_single_test(messages, ctx_label, model_name=None):
         "reasoned": reasoning_chars > 0,
         "token_source": "usage" if (usage or {}).get("completion_tokens") else "sse_chunks",
         "finish_reason": finish_reason,
-        # a run cut off at max_tokens is not comparable to one that stopped itself
-        "truncated": finish_reason == "length",
+        # a run cut off at max_tokens or closed before a terminal SSE event is incomplete
+        "truncated": finish_reason == "length" or not stream_completed,
         "think_kwargs": dict(THINK_KWARGS) or None,
     }
+    if not stream_completed:
+        out["error"] = "Incomplete SSE stream: closed before [DONE] or finish_reason"
     if first_content_time:
         out["ttft_content_s"] = round(first_content_time - start, 2)
     if reasoning_chars and (reasoning_chars + content_chars):
@@ -293,7 +298,7 @@ def run_benchmark(api_url, iterations, context_sizes, model_name, results_file):
             result["context_size"] = ctx_size
             result["iteration"] = i + 1
 
-            if "error" in result:
+            if result.get("error"):
                 print(f"FAILED: {result['error']}")
             else:
                 _think = ""
@@ -315,7 +320,7 @@ def run_benchmark(api_url, iterations, context_sizes, model_name, results_file):
             all_raw.append(result)
 
         # Compute averages (excluding errors)
-        good = [r for r in iter_results if "error" not in r]
+        good = [r for r in iter_results if not r.get("error")]
         if good:
             results[ctx_label] = {
                 "context_size": ctx_size,
