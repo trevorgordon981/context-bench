@@ -62,16 +62,43 @@ Every run is classified into an explicit `run_status` before any aggregation:
   `content_filter`).
 - `error`: HTTP non-200 status, timeout, or transport failure.
 
-### Prompt Token Tolerance & Cache Modes
+### Prompt Token Tolerance, Combined Total Tokens & Cache Modes
 
-- **Requested vs. observed tokens**: each row records `requested_context_tokens`,
-  `requested_prompt_tokens`, `requested_output_tokens`, `observed_prompt_tokens`,
-  `prompt_tokens_verified`, `prompt_size_basis`, and `observed_output_tokens`.
-  When the server reports `usage.prompt_tokens`, the benchmark verifies both
-  relative tolerance (`--prompt-token-tolerance`, default `±25%`) and that
-  `observed_prompt_tokens <= requested_context_tokens`. Out-of-tolerance or
-  over-budget rows set `prompt_token_mismatch=true` and
-  `prompt_tokens_verified=false`.
+- **Nominal tier vs. observed prompt and combined total tokens**: each tier is
+  configured with a nominal context size (`requested_context_tokens`, e.g.
+  `4096` for `4K`), a target input prompt size (`requested_prompt_tokens =
+  requested_context_tokens - requested_output_tokens`, e.g. `3584`), and a
+  reserved output budget (`requested_output_tokens`, default `512`). Every raw
+  row records `observed_prompt_tokens`, `observed_output_tokens`,
+  `observed_total_tokens` (`observed_prompt_tokens + observed_output_tokens`),
+  `effective_total_within_tier` (`observed_total_tokens <=
+  requested_context_tokens`), `prompt_tokens_verified`, and `prompt_size_basis`.
+  Every tier summary reports `observed_prompt_tokens_avg`,
+  `observed_output_tokens_avg`, `avg_observed_total_tokens`, and
+  `effective_total_within_tier`, and the console summary prints `ObsIn` and
+  `ObsTot` right beside the nominal `Context` tier.
+- **Prompt-tier tolerance vs. exact combined-total gating (`--strict-total-context`)**:
+  - When the server reports `usage.prompt_tokens`, the benchmark verifies both
+    relative tolerance (`--prompt-token-tolerance`, default `±25%`) against
+    `requested_prompt_tokens` and that `observed_prompt_tokens <=
+    requested_context_tokens`. Out-of-tolerance or over-budget prompts set
+    `prompt_token_mismatch=true` and `prompt_tokens_verified=false`.
+  - Because prompt verification allows `±25%` tokenizer variance, a prompt can
+    pass prompt-tier tolerance while `observed_prompt_tokens +
+    observed_output_tokens` exceeds the nominal tier (for example, `4000` prompt
+    + `512` completion = `4512` total under nominal `4K` / `4096`). In default
+    mode, such a run is **not** falsely called an exact `<=4096` combined-token
+    measurement: the row records `effective_total_within_tier=false` and a
+    `total_tokens_exceeded_nominal_tier` warning, the summary table flags
+    `OK (tot>tier)` alongside `ObsTot=4512`, and `recommendation` reports
+    `recommended_nominal_tier`, `recommended_observed_prompt_tokens`,
+    `recommended_observed_total_tokens`, `recommended_effective_total_within_tier`,
+    and `verification_scope="verified_prompt_tier_only"` (distinct from
+    `"verified_prompt_and_total_within_tier"`).
+  - Pass `--strict-total-context` for exact-total tier comparisons: any tier
+    whose combined `observed_total_tokens` exceeds `requested_context_tokens`
+    (or omits total usage) is disqualified as `TOTAL_OVER` (or `UNVERIFIED`)
+    rather than qualifying for `recommended_context`.
 - **Missing server token usage (fail-closed by default)**: if an endpoint omits
   `usage.prompt_tokens` (so `observed_prompt_tokens` is `null`), streaming
   latency and throughput are still measured and displayed in the report/census,
@@ -102,15 +129,22 @@ table. However, a context tier can only qualify for `recommended_context` when:
    explicitly passed, in which case the tier and recommendation are tagged `unverified`.
 3. It has zero `length_limited` (truncated) and zero `prompt_token_mismatch`
    runs.
-4. Its `avg_tps` drops by no more than `15%` from the first qualifying baseline
-   tier (unmeasurable, unverified, or zero-output rows never establish or disable
-   the verified baseline).
-5. Measured local host page-outs do not exceed `100` (when host swap telemetry
+4. When `--strict-total-context` is enabled, it has server-reported combined
+   `observed_total_tokens <= requested_context_tokens`
+   (`effective_total_within_tier=true`, zero `total_context_overrun` runs).
+5. Its `avg_tps` drops by no more than `15%` from the first qualifying baseline
+   tier (unmeasurable, unverified, strict-overrun, or zero-output rows never
+   establish or disable the verified baseline).
+6. Measured local host page-outs do not exceed `100` (when host swap telemetry
    is unavailable, the recommendation explicitly notes that swap pressure was
    not verified).
 
-If no tested tier meets all criteria, the benchmark reports
-`RECOMMENDATION: None` rather than defaulting to `4K`.
+The `recommendation` object always separates the nominal tier
+(`recommended_nominal_tier`, `recommended_nominal_context_tokens`) from the
+server-observed token counts (`recommended_observed_prompt_tokens`,
+`recommended_observed_total_tokens`), `recommended_effective_total_within_tier`,
+and `verification_scope`. If no tested tier meets all criteria, the benchmark
+reports `RECOMMENDATION: None` rather than defaulting to `4K`.
 
 ## Reasoning Models
 
@@ -186,20 +220,30 @@ sweeps five synthetic scenarios (`4K`, `8K`, `16K`, `32K`, `64K`):
 
 The JSON report includes full run configuration (`benchmark_host`,
 `endpoint_host`, `endpoint_is_local`, `cache_mode`, `prompt_token_tolerance`,
-`min_decode_interval_s`, `memory_telemetry`), a top-level `recommendation`
-object, per-size `summary` cohorts and exclusions, and all per-iteration `raw`
-records.
+`min_decode_interval_s`, `strict_total_context`, `memory_telemetry`), a
+top-level `recommendation` object (`recommended_context`,
+`recommended_nominal_tier`, `recommended_nominal_context_tokens`,
+`recommended_observed_prompt_tokens`, `recommended_observed_total_tokens`,
+`recommended_effective_total_within_tier`, `verification_scope`), per-size
+`summary` cohorts and exclusions (including `avg_observed_total_tokens` and
+`effective_total_within_tier`), and all per-iteration `raw` records.
 
 ## Methodology Limits
 
-- **Heuristic prompt sizing**: filler prompts use a `3.5 chars/token` heuristic
-  for repeated English technical prose. Actual token counts vary by tokenizer;
-  by default, a tier cannot qualify as a verified safe context recommendation
-  unless the server returns `usage.prompt_tokens` within tolerance. When a
-  server omits `usage.prompt_tokens`, streaming performance is still reported
-  under an approximate (`~`) size label with `UNVERIFIED` status unless
-  `--allow-unverified-usage` is explicitly passed (in which case any resulting
-  recommendation is still tagged `unverified`).
+- **Heuristic prompt sizing and combined-total variance**: filler prompts use a
+  `3.5 chars/token` heuristic for repeated English technical prose. Actual token
+  counts vary by tokenizer; by default, a tier cannot qualify as a verified safe
+  context recommendation unless the server returns `usage.prompt_tokens` within
+  tolerance (`±25%` of `requested_prompt_tokens` and `<= requested_context_tokens`).
+  Even when prompt verification succeeds, `observed_prompt_tokens +
+  observed_output_tokens` can exceed the nominal tier size; the benchmark tracks
+  `observed_total_tokens` (`ObsTot`) and `effective_total_within_tier` separately
+  from prompt verification, labels prompt-only matches distinctly from exact
+  within-tier totals, and provides `--strict-total-context` for exact-total
+  comparisons. When a server omits `usage.prompt_tokens`, streaming performance
+  is still reported under an approximate (`~`) size label with `UNVERIFIED`
+  status unless `--allow-unverified-usage` is explicitly passed (in which case
+  any resulting recommendation is still tagged `unverified`).
 - **Client-side timing**: `client_ttft_s` includes network and queueing latency
   in addition to server prefill. For pure server-side prefill timing, pair with
   engine telemetry.

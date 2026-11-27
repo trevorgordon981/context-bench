@@ -240,6 +240,18 @@ def _is_missing_prompt_usage(record):
     return False
 
 
+def _extract_observed_total_tokens(record):
+    """Return server-observed prompt+output total tokens from a run record, or None."""
+    total = _parse_token_count(record.get("observed_total_tokens"))
+    if total is not None:
+        return total
+    prompt = _parse_token_count(record.get("observed_prompt_tokens"))
+    output = _parse_token_count(record.get("observed_output_tokens"))
+    if prompt is not None and output is not None:
+        return prompt + output
+    return None
+
+
 def _error_result(
     error_message,
     *,
@@ -256,6 +268,7 @@ def _error_result(
         "run_status": "error",
         "qualifies_for_recommendation": False,
         "qualifies_for_verified_recommendation": False,
+        "qualifies_for_exact_total_recommendation": False,
         "disqualification_reasons": ["error"],
         "verification_warnings": [],
         "ttft_s": None,
@@ -267,6 +280,9 @@ def _error_result(
         "requested_context_tokens": requested_context_tokens,
         "requested_prompt_tokens": requested_prompt_tokens,
         "observed_prompt_tokens": None,
+        "observed_total_tokens": None,
+        "effective_total_within_tier": None,
+        "total_token_overrun": False,
         "prompt_tokens_verified": False,
         "prompt_size_basis": "heuristic_estimate",
         "prompt_token_ratio": None,
@@ -305,6 +321,7 @@ def run_single_test(
     prompt_token_tolerance=PROMPT_TOKEN_TOLERANCE,
     min_decode_interval_s=MIN_DECODE_INTERVAL_S,
     allow_unverified_usage=False,
+    strict_total_context=False,
 ):
     """Send a streaming request and measure client-observed prefill/decode behaviour.
 
@@ -328,6 +345,13 @@ def run_single_test(
         run is disqualified (`missing_prompt_token_usage`) unless
         `allow_unverified_usage=True` is explicitly opted in (still tagged
         unverified).
+      * Combined `observed_total_tokens` (`observed_prompt_tokens +
+        observed_output_tokens`) and `effective_total_within_tier`
+        (`observed_total_tokens <= requested_context_tokens`) are tracked
+        separately from prompt-tier verification. In default mode, a combined
+        total exceeding `requested_context_tokens` is flagged as a warning
+        (`total_tokens_exceeded_nominal_tier`); with `strict_total_context=True`,
+        combined total overrun or missing total usage disqualifies the run.
     """
     req_output_tokens = (
         OUTPUT_TOKENS if requested_output_tokens is None else requested_output_tokens
@@ -544,6 +568,29 @@ def run_single_test(
         "server_usage" if usage_prompt_tokens is not None else "heuristic_estimate"
     )
 
+    # Combined prompt + completion total token accounting (separate from prompt-tier
+    # tolerance verification).
+    observed_prompt_int = (
+        int(usage_prompt_tokens) if usage_prompt_tokens is not None else None
+    )
+    observed_output_int = (
+        int(usage_completion_tokens) if usage_completion_tokens is not None else None
+    )
+    observed_total_tokens = (
+        observed_prompt_int + observed_output_int
+        if (observed_prompt_int is not None and observed_output_int is not None)
+        else None
+    )
+    effective_total_within_tier = (
+        observed_total_tokens <= requested_context_tokens
+        if (
+            observed_total_tokens is not None
+            and requested_context_tokens is not None
+        )
+        else None
+    )
+    total_token_overrun = effective_total_within_tier is False
+
     disqualification_reasons = []
     verification_warnings = []
     if run_status != "completed":
@@ -561,6 +608,18 @@ def run_single_test(
             verification_warnings.append("missing_prompt_token_usage")
         else:
             disqualification_reasons.append("missing_prompt_token_usage")
+    if total_token_overrun:
+        if strict_total_context:
+            disqualification_reasons.append("total_context_overrun")
+        else:
+            verification_warnings.append("total_tokens_exceeded_nominal_tier")
+    elif (
+        strict_total_context
+        and observed_total_tokens is None
+        and requested_context_tokens is not None
+        and error_msg is None
+    ):
+        disqualification_reasons.append("missing_total_token_usage")
     if not decode_tps_measurable:
         disqualification_reasons.append(
             decode_tps_exclusion_reason or "unmeasurable_decode_tps"
@@ -569,29 +628,30 @@ def run_single_test(
     qualifies_for_verified_recommendation = (
         qualifies_for_recommendation and prompt_tokens_verified
     )
+    qualifies_for_exact_total_recommendation = (
+        qualifies_for_verified_recommendation and (effective_total_within_tier is True)
+    )
 
     rounded_ttft = round(ttft, 3) if ttft is not None else None
     out = {
         "run_status": run_status,
         "qualifies_for_recommendation": qualifies_for_recommendation,
         "qualifies_for_verified_recommendation": qualifies_for_verified_recommendation,
+        "qualifies_for_exact_total_recommendation": qualifies_for_exact_total_recommendation,
         "disqualification_reasons": disqualification_reasons,
         "verification_warnings": verification_warnings,
         "ttft_s": rounded_ttft,
         "client_ttft_s": rounded_ttft,
         "total_s": round(total_time, 3),
         "output_tokens": output_tokens,
-        "observed_output_tokens": (
-            int(usage_completion_tokens)
-            if usage_completion_tokens is not None
-            else None
-        ),
+        "observed_output_tokens": observed_output_int,
         "requested_output_tokens": req_output_tokens,
         "requested_context_tokens": requested_context_tokens,
         "requested_prompt_tokens": requested_prompt_tokens,
-        "observed_prompt_tokens": (
-            int(usage_prompt_tokens) if usage_prompt_tokens is not None else None
-        ),
+        "observed_prompt_tokens": observed_prompt_int,
+        "observed_total_tokens": observed_total_tokens,
+        "effective_total_within_tier": effective_total_within_tier,
+        "total_token_overrun": total_token_overrun,
         "prompt_tokens_verified": prompt_tokens_verified,
         "prompt_size_basis": prompt_size_basis,
         "prompt_token_ratio": prompt_token_ratio,
@@ -688,6 +748,44 @@ def summarize_context_runs(ctx_size, iter_results, requested_prompt_tokens=None)
     observed_prompt_avg = _avg(
         [r.get("observed_prompt_tokens") for r in iter_results], ndigits=1
     )
+    observed_output_avg = _avg(
+        [r.get("observed_output_tokens") for r in iter_results], ndigits=1
+    )
+    observed_totals = [_extract_observed_total_tokens(r) for r in iter_results]
+    valid_observed_totals = [t for t in observed_totals if t is not None]
+    avg_observed_total_tokens = _avg(valid_observed_totals, ndigits=1)
+    max_observed_total_tokens = (
+        max(valid_observed_totals) if valid_observed_totals else None
+    )
+
+    total_overrun = [
+        r
+        for r in iter_results
+        if not r.get("error")
+        and (
+            r.get("total_token_overrun") is True
+            or r.get("effective_total_within_tier") is False
+            or (
+                _extract_observed_total_tokens(r) is not None
+                and _extract_observed_total_tokens(r) > ctx_size
+            )
+        )
+    ]
+    missing_total_usage = [
+        r
+        for r in iter_results
+        if not r.get("error") and _extract_observed_total_tokens(r) is None
+    ]
+    completed_with_total = [
+        r for r in completed_normal if _extract_observed_total_tokens(r) is not None
+    ]
+    if total_overrun:
+        effective_total_within_tier = False
+    elif completed_with_total and len(missing_total_usage) == 0:
+        effective_total_within_tier = True
+    else:
+        effective_total_within_tier = None
+
     prompt_tokens_verified = (
         len(missing_prompt_usage) == 0
         and len(token_mismatch) == 0
@@ -740,10 +838,20 @@ def summarize_context_runs(ctx_size, iter_results, requested_prompt_tokens=None)
             else ctx_size - OUTPUT_TOKENS
         ),
         "observed_prompt_tokens_avg": observed_prompt_avg,
+        "observed_output_tokens_avg": observed_output_avg,
+        "avg_observed_total_tokens": avg_observed_total_tokens,
+        "max_observed_total_tokens": max_observed_total_tokens,
+        "effective_total_within_tier": effective_total_within_tier,
         "prompt_tokens_verified": prompt_tokens_verified,
         "prompt_size_basis": prompt_size_basis,
         "verified_prompt_runs": len(verified_prompt_runs),
         "unverified_prompt_runs": len(missing_prompt_usage),
+        "total_within_tier_runs": sum(
+            1
+            for r in completed_with_total
+            if _extract_observed_total_tokens(r) <= ctx_size
+        ),
+        "total_overrun_runs": len(total_overrun),
         "avg_ttft_s": _avg([r.get("ttft_s") for r in completed_normal], 3),
         "avg_tps": _avg([r.get("tokens_per_sec") for r in decode_measured], 2),
         "avg_e2e_tps": _avg(
@@ -770,12 +878,16 @@ def summarize_context_runs(ctx_size, iter_results, requested_prompt_tokens=None)
             "other_finish": len(other_finish),
             "token_mismatch": len(token_mismatch),
             "missing_prompt_token_usage": len(missing_prompt_usage),
+            "total_context_overrun": len(total_overrun),
+            "missing_total_token_usage": len(missing_total_usage),
         },
         "truncated_cohort": truncated_cohort,
     }
 
 
-def evaluate_summary(results, *, allow_unverified_usage=False):
+def evaluate_summary(
+    results, *, allow_unverified_usage=False, strict_total_context=False
+):
     """Evaluate summary rows and determine the safe context-window recommendation.
 
     Only rows with strictly positive measurable decode TPS, verified server
@@ -784,12 +896,23 @@ def evaluate_summary(results, *, allow_unverified_usage=False):
     `unverified`), no length truncation, no swap pressure, and <= 15% decode TPS
     drop from the first qualifying baseline can qualify as a recommended safe
     context.
+
+    Prompt-tier fidelity (`prompt_tokens_verified`) is tracked separately from
+    combined prompt+output containment (`effective_total_within_tier`). When
+    `strict_total_context=True`, tiers whose observed prompt+completion total
+    exceeds `context_size` (or lacks server-reported total usage) are rejected
+    from qualification (`TOTAL_OVER` / `UNVERIFIED`).
     """
     baseline_tps = None
     recommended = None
     recommended_verified = False
+    recommended_nominal_context_tokens = None
+    recommended_observed_prompt_tokens = None
+    recommended_observed_total_tokens = None
+    recommended_effective_total_within_tier = None
     swap_telemetry_available = False
     unverified_tiers = []
+    total_overrun_tiers = []
     row_evaluations = {}
 
     for label, data in results.items():
@@ -800,6 +923,17 @@ def evaluate_summary(results, *, allow_unverified_usage=False):
         if avg_pageouts is not None:
             swap_telemetry_available = True
 
+        context_size = data.get("context_size")
+        avg_obs_prompt = data.get("observed_prompt_tokens_avg")
+        avg_obs_total = data.get("avg_observed_total_tokens")
+        eff_total_within = data.get("effective_total_within_tier")
+        if (
+            eff_total_within is None
+            and avg_obs_total is not None
+            and context_size is not None
+        ):
+            eff_total_within = avg_obs_total <= context_size
+
         has_missing_usage = cohorts.get("missing_prompt_token_usage", 0) > 0
         has_unverified_completed = (
             data.get("runs", 0) > 0 and data.get("prompt_tokens_verified") is False
@@ -808,11 +942,27 @@ def evaluate_summary(results, *, allow_unverified_usage=False):
         if row_unverified:
             unverified_tiers.append(label)
 
+        has_total_overrun = (
+            cohorts.get("total_context_overrun", 0) > 0
+            or eff_total_within is False
+        )
+        if has_total_overrun:
+            total_overrun_tiers.append(label)
+
+        has_missing_total_strict = strict_total_context and (
+            cohorts.get("missing_total_token_usage", 0) > 0
+            or (data.get("runs", 0) > 0 and eff_total_within is None)
+        )
+        blocked_by_strict_total = strict_total_context and (
+            has_total_overrun or has_missing_total_strict
+        )
+
         if (
             qualifying_runs == 0
             or avg_tps is None
             or avg_tps <= 0
             or (row_unverified and not allow_unverified_usage)
+            or blocked_by_strict_total
         ):
             if cohorts.get("token_mismatch", 0) > 0 and cohorts.get("length_limited", 0) > 0:
                 status = "TRUNC+SIZE"
@@ -822,7 +972,9 @@ def evaluate_summary(results, *, allow_unverified_usage=False):
                 status = "TRUNCATED"
             elif data.get("runs", 0) > 0 and avg_tps is None:
                 status = "NO_DECODE"
-            elif row_unverified:
+            elif strict_total_context and has_total_overrun:
+                status = "TOTAL_OVER"
+            elif row_unverified or has_missing_total_strict:
                 status = "UNVERIFIED"
             elif (
                 cohorts.get("no_output", 0) > 0
@@ -837,6 +989,7 @@ def evaluate_summary(results, *, allow_unverified_usage=False):
                 "status": status,
                 "qualifies": False,
                 "verified": not row_unverified,
+                "effective_total_within_tier": eff_total_within,
                 "tps_drop_pct": None,
             }
             continue
@@ -865,15 +1018,25 @@ def evaluate_summary(results, *, allow_unverified_usage=False):
             status = f"-{tps_drop:.0f}%"
             qualifies = False
         else:
-            status = "OK (unverified)" if row_unverified else "OK"
+            if row_unverified:
+                status = "OK (unverified)"
+            elif has_total_overrun:
+                status = "OK (tot>tier)"
+            else:
+                status = "OK"
             qualifies = True
             recommended = label
             recommended_verified = not row_unverified
+            recommended_nominal_context_tokens = context_size
+            recommended_observed_prompt_tokens = avg_obs_prompt
+            recommended_observed_total_tokens = avg_obs_total
+            recommended_effective_total_within_tier = eff_total_within
 
         row_evaluations[label] = {
             "status": status,
             "qualifies": qualifies,
             "verified": not row_unverified,
+            "effective_total_within_tier": eff_total_within,
             "tps_drop_pct": tps_drop,
         }
 
@@ -884,13 +1047,58 @@ def evaluate_summary(results, *, allow_unverified_usage=False):
     )
     if recommended and recommended_verified:
         recommendation_status = "verified"
-        note = (
-            f"Highest verified qualifying size with server-reported prompt_tokens "
-            f"within tolerance, <={TPS_DROP_THRESHOLD_PCT:.0f}% streaming decode TPS "
-            f"drop, and {swap_note}."
-        )
+        if recommended_effective_total_within_tier is True:
+            verification_scope = "verified_prompt_and_total_within_tier"
+            obs_detail = ""
+            if (
+                recommended_observed_prompt_tokens is not None
+                and recommended_observed_total_tokens is not None
+                and recommended_nominal_context_tokens is not None
+            ):
+                obs_detail = (
+                    f" (observed avg prompt={recommended_observed_prompt_tokens:.0f}, "
+                    f"total={recommended_observed_total_tokens:.0f} <= "
+                    f"{recommended_nominal_context_tokens})"
+                )
+            note = (
+                f"Highest verified qualifying nominal tier ({recommended}) with "
+                f"server-reported prompt_tokens within tolerance, combined "
+                f"prompt+completion total within nominal tier{obs_detail}, "
+                f"<={TPS_DROP_THRESHOLD_PCT:.0f}% streaming decode TPS drop, and "
+                f"{swap_note}."
+            )
+        elif recommended_effective_total_within_tier is False:
+            verification_scope = "verified_prompt_tier_only"
+            obs_detail = (
+                f"observed avg prompt={recommended_observed_prompt_tokens:.0f}, "
+                f"total={recommended_observed_total_tokens:.0f} exceeded nominal "
+                f"{recommended_nominal_context_tokens}"
+                if (
+                    recommended_observed_prompt_tokens is not None
+                    and recommended_observed_total_tokens is not None
+                    and recommended_nominal_context_tokens is not None
+                )
+                else "observed prompt+completion total exceeded the nominal context size"
+            )
+            note = (
+                f"Highest qualifying nominal tier ({recommended}) with "
+                f"server-reported prompt_tokens within ±{PROMPT_TOKEN_TOLERANCE:.0%} "
+                f"tolerance, <={TPS_DROP_THRESHOLD_PCT:.0f}% streaming decode TPS "
+                f"drop, and {swap_note}. Combined total note: {obs_detail} "
+                "(prompt-tier verified only, not an exact <=nominal-tier total run; "
+                "pass --strict-total-context to require observed total <= nominal tier)."
+            )
+        else:
+            verification_scope = "verified_prompt_only_total_unreported"
+            note = (
+                f"Highest verified qualifying nominal tier ({recommended}) with "
+                f"server-reported prompt_tokens within tolerance, "
+                f"<={TPS_DROP_THRESHOLD_PCT:.0f}% streaming decode TPS drop, and "
+                f"{swap_note} (combined prompt+completion total not reported by server)."
+            )
     elif recommended:
         recommendation_status = "unverified"
+        verification_scope = "unverified_heuristic"
         note = (
             f"UNVERIFIED: server omitted usage.prompt_tokens for {recommended}; "
             f"context size is an approximate heuristic estimate (~{CHARS_PER_TOKEN} "
@@ -900,7 +1108,17 @@ def evaluate_summary(results, *, allow_unverified_usage=False):
         )
     else:
         recommendation_status = "none"
-        if unverified_tiers:
+        verification_scope = "none"
+        if strict_total_context and total_overrun_tiers:
+            over_str = ", ".join(total_overrun_tiers)
+            note = (
+                f"No tested context size met strict-total-context qualification "
+                f"criteria. Observed prompt+completion totals exceeded nominal "
+                f"context size on tier(s) [{over_str}] (--strict-total-context "
+                f"requires observed_prompt_tokens + observed_output_tokens <= "
+                f"requested_context_tokens)."
+            )
+        elif unverified_tiers:
             tiers_str = ", ".join(unverified_tiers)
             note = (
                 f"No tested context size met verified qualification criteria. "
@@ -918,11 +1136,19 @@ def evaluate_summary(results, *, allow_unverified_usage=False):
 
     return {
         "recommended_context": recommended,
+        "recommended_nominal_tier": recommended,
+        "recommended_nominal_context_tokens": recommended_nominal_context_tokens,
+        "recommended_observed_prompt_tokens": recommended_observed_prompt_tokens,
+        "recommended_observed_total_tokens": recommended_observed_total_tokens,
+        "recommended_effective_total_within_tier": recommended_effective_total_within_tier,
         "recommended_context_verified": recommended_verified,
         "recommendation_status": recommendation_status,
+        "verification_scope": verification_scope,
         "unverified": bool(recommended and not recommended_verified),
         "allow_unverified_usage": allow_unverified_usage,
+        "strict_total_context": strict_total_context,
         "unverified_tiers": unverified_tiers,
+        "total_overrun_tiers": total_overrun_tiers,
         "baseline_tps": baseline_tps,
         "tps_drop_threshold_pct": TPS_DROP_THRESHOLD_PCT,
         "swap_pageout_threshold": SWAP_PAGEOUT_THRESHOLD,
@@ -947,6 +1173,7 @@ def run_benchmark(
     prompt_token_tolerance=PROMPT_TOKEN_TOLERANCE,
     min_decode_interval_s=MIN_DECODE_INTERVAL_S,
     allow_unverified_usage=False,
+    strict_total_context=False,
 ):
     global API_URL, MODEL_NAME
     API_URL = api_url
@@ -966,7 +1193,12 @@ def run_benchmark(
         if allow_unverified_usage
         else "verified server usage.prompt_tokens required"
     )
-    print(f"\n{'='*96}")
+    total_policy = (
+        "strict (observed prompt+output <= nominal tier)"
+        if strict_total_context
+        else "advisory (prompt-tier tolerance; --strict-total-context for exact total <= tier)"
+    )
+    print(f"\n{'='*106}")
     print("  Context Window Benchmark")
     print(f"  {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
     print(f"  API: {api_url} ({'local' if endpoint_is_local else 'remote'} endpoint)")
@@ -981,7 +1213,8 @@ def run_benchmark(
         f"Cache mode: {cache_mode}, Prompt tol: ±{prompt_token_tolerance:.0%}"
     )
     print(f"  Prompt size verification: {usage_policy}")
-    print(f"{'='*96}\n")
+    print(f"  Total context gating: {total_policy}")
+    print(f"{'='*106}\n")
 
     for ctx_size in context_sizes:
         ctx_label = f"{ctx_size // 1024}K"
@@ -1011,6 +1244,7 @@ def run_benchmark(
                 prompt_token_tolerance=prompt_token_tolerance,
                 min_decode_interval_s=min_decode_interval_s,
                 allow_unverified_usage=allow_unverified_usage,
+                strict_total_context=strict_total_context,
             )
 
             pageouts_after, mem_free_after = sample_host_memory(endpoint_is_local)
@@ -1051,6 +1285,10 @@ def run_benchmark(
                     _flags.append(
                         f"UNVERIFIED_SIZE(est~{result.get('requested_prompt_tokens')})"
                     )
+                if result.get("total_token_overrun"):
+                    _flags.append(
+                        f"TOTAL_OVER(obs={result.get('observed_total_tokens')}/{ctx_size})"
+                    )
                 if not result.get("decode_tps_measurable"):
                     _flags.append(
                         f"DECODE_NA({result.get('decode_tps_exclusion_reason')})"
@@ -1087,7 +1325,9 @@ def run_benchmark(
         print()
 
     evaluation = evaluate_summary(
-        results, allow_unverified_usage=allow_unverified_usage
+        results,
+        allow_unverified_usage=allow_unverified_usage,
+        strict_total_context=strict_total_context,
     )
     for label, row_eval in evaluation["rows"].items():
         results[label]["status"] = row_eval["status"]
@@ -1132,16 +1372,33 @@ def run_benchmark(
             "min_decode_interval_s": min_decode_interval_s,
             "allow_unverified_usage": allow_unverified_usage,
             "require_prompt_token_usage": not allow_unverified_usage,
+            "strict_total_context": strict_total_context,
             "think_kwargs": dict(THINK_KWARGS) or None,
             "memory_telemetry": mem_telemetry,
         },
         "recommendation": {
             "recommended_context": evaluation["recommended_context"],
+            "recommended_nominal_tier": evaluation["recommended_nominal_tier"],
+            "recommended_nominal_context_tokens": evaluation[
+                "recommended_nominal_context_tokens"
+            ],
+            "recommended_observed_prompt_tokens": evaluation[
+                "recommended_observed_prompt_tokens"
+            ],
+            "recommended_observed_total_tokens": evaluation[
+                "recommended_observed_total_tokens"
+            ],
+            "recommended_effective_total_within_tier": evaluation[
+                "recommended_effective_total_within_tier"
+            ],
             "recommended_context_verified": evaluation["recommended_context_verified"],
             "recommendation_status": evaluation["recommendation_status"],
+            "verification_scope": evaluation["verification_scope"],
             "unverified": evaluation["unverified"],
             "allow_unverified_usage": evaluation["allow_unverified_usage"],
+            "strict_total_context": evaluation["strict_total_context"],
             "unverified_tiers": evaluation["unverified_tiers"],
+            "total_overrun_tiers": evaluation["total_overrun_tiers"],
             "baseline_tps": evaluation["baseline_tps"],
             "tps_drop_threshold_pct": evaluation["tps_drop_threshold_pct"],
             "swap_pageout_threshold": evaluation["swap_pageout_threshold"],
@@ -1155,21 +1412,34 @@ def run_benchmark(
     print(f"Raw results saved to {results_file}\n")
 
     # Summary table
-    print(f"{'='*96}")
+    print(f"{'='*106}")
     print("  SUMMARY")
-    print(f"{'='*96}")
+    print(f"{'='*106}")
     print(
-        f"  {'Context':>7}  {'ObsIn':>7}  {'TTFT':>7}  {'DecTPS':>7}  {'E2ETPS':>7}  "
-        f"{'Total':>7}  {'Pageouts':>8}  {'Qual':>5}  {'Status':>15}"
+        f"  {'Context':>7}  {'ObsIn':>7}  {'ObsTot':>7}  {'TTFT':>7}  {'DecTPS':>7}  "
+        f"{'E2ETPS':>7}  {'Total':>7}  {'Pageouts':>8}  {'Qual':>5}  {'Status':>15}"
     )
     print(
         f"  {'─'*7}  {'─'*7}  {'─'*7}  {'─'*7}  {'─'*7}  "
-        f"{'─'*7}  {'─'*8}  {'─'*5}  {'─'*15}"
+        f"{'─'*7}  {'─'*7}  {'─'*8}  {'─'*5}  {'─'*15}"
     )
 
     total_exclusions = Counter()
     total_disqualified_cohorts = Counter()
     any_unverified_row = False
+    any_total_overrun_ok = False
+
+    cohort_keys = [
+        "length_limited",
+        "no_output",
+        "incomplete",
+        "error",
+        "other_finish",
+        "token_mismatch",
+        "missing_prompt_token_usage",
+    ]
+    if strict_total_context:
+        cohort_keys.extend(["total_context_overrun", "missing_total_token_usage"])
 
     for label, data in results.items():
         status = data["status"]
@@ -1177,10 +1447,16 @@ def run_benchmark(
         is_unverified_row = cohorts.get("missing_prompt_token_usage", 0) > 0
         if is_unverified_row:
             any_unverified_row = True
+        if status == "OK (tot>tier)":
+            any_total_overrun_ok = True
         display_label = f"~{label}" if is_unverified_row else label
         obs_in_empty = "unverif" if is_unverified_row else "—"
         obs_in_str = _fmt_opt(
             data.get("observed_prompt_tokens_avg"), "{:.0f}", empty=obs_in_empty
+        )
+        obs_tot_empty = "unverif" if is_unverified_row else "—"
+        obs_tot_str = _fmt_opt(
+            data.get("avg_observed_total_tokens"), "{:.0f}", empty=obs_tot_empty
         )
         qual_str = f"{data['qualifying_runs']}/{data['total_runs']}"
         ttft_str = _fmt_opt(data["avg_ttft_s"], "{:.2f}s")
@@ -1191,33 +1467,32 @@ def run_benchmark(
         pg_str = _fmt_opt(data["avg_pageouts"], "{:.0f}", empty="N/A")
 
         print(
-            f"  {display_label:>7}  {obs_in_str:>7}  {ttft_str:>7}  {dec_str:>7}  "
-            f"{e2e_str:>7}  {tot_str:>7}  {pg_str:>8}  {qual_str:>5}  {status:>15}"
+            f"  {display_label:>7}  {obs_in_str:>7}  {obs_tot_str:>7}  {ttft_str:>7}  "
+            f"{dec_str:>7}  {e2e_str:>7}  {tot_str:>7}  {pg_str:>8}  "
+            f"{qual_str:>5}  {status:>15}"
         )
 
         total_exclusions.update(data.get("decode_tps_exclusions") or {})
-        for key in (
-            "length_limited",
-            "no_output",
-            "incomplete",
-            "error",
-            "other_finish",
-            "token_mismatch",
-            "missing_prompt_token_usage",
-        ):
+        for key in cohort_keys:
             count = cohorts.get(key, 0)
             if count:
                 total_disqualified_cohorts[key] += count
 
     print(
         f"  {'─'*7}  {'─'*7}  {'─'*7}  {'─'*7}  {'─'*7}  "
-        f"{'─'*7}  {'─'*8}  {'─'*5}  {'─'*15}"
+        f"{'─'*7}  {'─'*7}  {'─'*8}  {'─'*5}  {'─'*15}"
     )
 
     if any_unverified_row:
         print(
-            "  Note: '~' context sizes and ObsIn=unverif indicate approximate heuristic "
-            "prompt sizes (server omitted usage.prompt_tokens)."
+            "  Note: '~' context sizes and ObsIn/ObsTot=unverif indicate approximate "
+            "heuristic prompt sizes (server omitted usage.prompt_tokens)."
+        )
+    if any_total_overrun_ok:
+        print(
+            "  Note: 'OK (tot>tier)' means prompt_tokens passed tolerance, but "
+            "observed prompt+completion total (ObsTot) exceeded the nominal context "
+            "tier (pass --strict-total-context to require ObsTot <= nominal tier)."
         )
     if total_exclusions:
         excl_fmt = ", ".join(f"{k}={v}" for k, v in sorted(total_exclusions.items()))
@@ -1234,7 +1509,26 @@ def run_benchmark(
     print()
     if evaluation["recommended_context"]:
         if evaluation["recommended_context_verified"]:
-            print(f"  RECOMMENDATION: {evaluation['recommended_context']} context window")
+            obs_p = evaluation["recommended_observed_prompt_tokens"]
+            obs_t = evaluation["recommended_observed_total_tokens"]
+            nom_t = evaluation["recommended_nominal_context_tokens"]
+            within = evaluation["recommended_effective_total_within_tier"]
+            if obs_p is not None and obs_t is not None and nom_t is not None:
+                budget_tag = (
+                    f"<= {nom_t} within tier"
+                    if within
+                    else f"> {nom_t} EXCEEDS nominal tier"
+                )
+                detail_str = (
+                    f" (nominal tier {evaluation['recommended_nominal_tier']}; "
+                    f"obs prompt={obs_p:.0f}, obs total={obs_t:.0f} {budget_tag})"
+                )
+            else:
+                detail_str = ""
+            print(
+                f"  RECOMMENDATION: {evaluation['recommended_context']} context "
+                f"window{detail_str}"
+            )
         else:
             print(
                 f"  RECOMMENDATION: ~{evaluation['recommended_context']} context window "
@@ -1451,6 +1745,7 @@ def run_demo(
     context_sizes=None,
     cache_mode="cold",
     allow_unverified_usage=False,
+    strict_total_context=False,
 ):
     """Run an offline end-to-end synthetic mock-SSE benchmark demo."""
     sizes = context_sizes or [4096, 8192, 16384, 32768, 65536]
@@ -1464,6 +1759,7 @@ def run_demo(
             results_file=results_file,
             cache_mode=cache_mode,
             allow_unverified_usage=allow_unverified_usage,
+            strict_total_context=strict_total_context,
         )
     finally:
         server.shutdown()
@@ -1529,6 +1825,15 @@ def build_arg_parser():
         "heuristic prompt sizing (~3.5 chars/token). Off by default.",
     )
     parser.add_argument(
+        "--strict-total-context",
+        action="store_true",
+        default=False,
+        help="Exact-total comparison mode: require server-reported combined "
+        "observed_prompt_tokens + observed_output_tokens <= requested_context_tokens "
+        "(nominal tier) to qualify. Tiers that exceed the nominal tier budget are "
+        "rejected as TOTAL_OVER. Off by default (advisory tracking).",
+    )
+    parser.add_argument(
         "--think",
         choices=["on", "off"],
         default=None,
@@ -1583,6 +1888,7 @@ if __name__ == "__main__":
             context_sizes=sizes,
             cache_mode=args.cache_mode,
             allow_unverified_usage=args.allow_unverified_usage,
+            strict_total_context=args.strict_total_context,
         )
     else:
         run_benchmark(
@@ -1595,4 +1901,5 @@ if __name__ == "__main__":
             prompt_token_tolerance=args.prompt_token_tolerance,
             min_decode_interval_s=args.min_decode_interval,
             allow_unverified_usage=args.allow_unverified_usage,
+            strict_total_context=args.strict_total_context,
         )

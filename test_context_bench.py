@@ -1313,5 +1313,314 @@ class TestCB05UnverifiedPromptUsageGating(unittest.TestCase):
         self.assertTrue(opt_in_args.allow_unverified_usage)
 
 
+class TestCB06ObservedTotalContextAccounting(unittest.TestCase):
+    def _make_4000_plus_512_stream(self):
+        return _sse_lines(
+            [
+                _delta(content="First generation frame "),
+                _delta(content="second generation frame."),
+                {"choices": [{"delta": {}, "finish_reason": "stop"}]},
+                {
+                    "choices": [],
+                    "usage": {"prompt_tokens": 4000, "completion_tokens": 512},
+                },
+            ],
+            include_done=True,
+        )
+
+    def test_cb06_4000_prompt_plus_512_output_under_nominal_4096_default_mode(self):
+        """CB06 reproduction: 4000 prompt + 512 output = 4512 total under nominal 4K (4096)."""
+        lines = self._make_4000_plus_512_stream()
+        clock = _SequenceClock([0.0, 0.2, 0.7, 0.8])
+        fake_httpx = types.SimpleNamespace(
+            Client=_ScriptedClientFactory([_FakeResponse(lines)]),
+            Timeout=lambda *a, **k: None,
+            TimeoutException=TimeoutError,
+        )
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            results_path = Path(tmpdir) / "cb06-default.json"
+            buf = io.StringIO()
+            with (
+                mock.patch.object(cb, "httpx", fake_httpx),
+                mock.patch.object(cb.time, "monotonic", side_effect=clock),
+                mock.patch.object(cb, "get_pageout_count", return_value=0),
+                mock.patch.object(cb, "get_memory_pressure", return_value=80),
+                redirect_stdout(buf),
+            ):
+                payload = cb.run_benchmark(
+                    "http://127.0.0.1:8090/v1",
+                    iterations=1,
+                    context_sizes=[4096],
+                    model_name="cb06-model",
+                    results_file=results_path,
+                )
+
+        raw = payload["raw"][0]
+        self.assertEqual(raw["requested_context_tokens"], 4096)
+        self.assertEqual(raw["requested_prompt_tokens"], 3584)
+        self.assertEqual(raw["observed_prompt_tokens"], 4000)
+        self.assertEqual(raw["observed_output_tokens"], 512)
+        self.assertEqual(raw["observed_total_tokens"], 4512)
+        self.assertFalse(raw["effective_total_within_tier"])
+        self.assertTrue(raw["total_token_overrun"])
+        self.assertTrue(raw["prompt_tokens_verified"])
+        self.assertTrue(raw["prompt_tokens_within_tolerance"])
+        self.assertFalse(raw["prompt_token_mismatch"])
+        self.assertTrue(raw["qualifies_for_recommendation"])
+        self.assertTrue(raw["qualifies_for_verified_recommendation"])
+        self.assertFalse(raw["qualifies_for_exact_total_recommendation"])
+        self.assertEqual(raw["disqualification_reasons"], [])
+        self.assertIn(
+            "total_tokens_exceeded_nominal_tier", raw["verification_warnings"]
+        )
+
+        s4 = payload["summary"]["4K"]
+        self.assertEqual(s4["observed_prompt_tokens_avg"], 4000.0)
+        self.assertEqual(s4["observed_output_tokens_avg"], 512.0)
+        self.assertEqual(s4["avg_observed_total_tokens"], 4512.0)
+        self.assertEqual(s4["max_observed_total_tokens"], 4512)
+        self.assertFalse(s4["effective_total_within_tier"])
+        self.assertEqual(s4["total_within_tier_runs"], 0)
+        self.assertEqual(s4["total_overrun_runs"], 1)
+        self.assertEqual(s4["cohorts"]["total_context_overrun"], 1)
+        self.assertEqual(s4["status"], "OK (tot>tier)")
+        self.assertTrue(s4["qualifies"])
+        self.assertTrue(s4["verified"])
+
+        rec = payload["recommendation"]
+        self.assertEqual(rec["recommended_context"], "4K")
+        self.assertEqual(rec["recommended_nominal_tier"], "4K")
+        self.assertEqual(rec["recommended_nominal_context_tokens"], 4096)
+        self.assertEqual(rec["recommended_observed_prompt_tokens"], 4000.0)
+        self.assertEqual(rec["recommended_observed_total_tokens"], 4512.0)
+        self.assertFalse(rec["recommended_effective_total_within_tier"])
+        self.assertTrue(rec["recommended_context_verified"])
+        self.assertEqual(rec["recommendation_status"], "verified")
+        self.assertEqual(rec["verification_scope"], "verified_prompt_tier_only")
+        self.assertFalse(rec["strict_total_context"])
+        self.assertEqual(rec["total_overrun_tiers"], ["4K"])
+        self.assertIn("4512", rec["note"])
+        self.assertIn("4096", rec["note"])
+        self.assertIn("--strict-total-context", rec["note"])
+
+        out_text = buf.getvalue()
+        self.assertIn("ObsTot", out_text)
+        self.assertIn("4512", out_text)
+        self.assertIn("OK (tot>tier)", out_text)
+        self.assertIn("TOTAL_OVER(obs=4512/4096)", out_text)
+        self.assertIn("EXCEEDS nominal tier", out_text)
+
+    def test_cb06_4000_prompt_plus_512_output_rejected_under_strict_total_context(self):
+        """With --strict-total-context, 4000 + 512 = 4512 under nominal 4096 is rejected."""
+        lines = self._make_4000_plus_512_stream()
+        clock = _SequenceClock([0.0, 0.2, 0.7, 0.8])
+        fake_httpx = types.SimpleNamespace(
+            Client=_ScriptedClientFactory([_FakeResponse(lines)]),
+            Timeout=lambda *a, **k: None,
+            TimeoutException=TimeoutError,
+        )
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            results_path = Path(tmpdir) / "cb06-strict.json"
+            buf = io.StringIO()
+            with (
+                mock.patch.object(cb, "httpx", fake_httpx),
+                mock.patch.object(cb.time, "monotonic", side_effect=clock),
+                mock.patch.object(cb, "get_pageout_count", return_value=0),
+                mock.patch.object(cb, "get_memory_pressure", return_value=80),
+                redirect_stdout(buf),
+            ):
+                payload = cb.run_benchmark(
+                    "http://127.0.0.1:8090/v1",
+                    iterations=1,
+                    context_sizes=[4096],
+                    model_name="cb06-model",
+                    results_file=results_path,
+                    strict_total_context=True,
+                )
+
+        raw = payload["raw"][0]
+        self.assertEqual(raw["observed_total_tokens"], 4512)
+        self.assertFalse(raw["effective_total_within_tier"])
+        self.assertTrue(raw["total_token_overrun"])
+        self.assertFalse(raw["qualifies_for_recommendation"])
+        self.assertFalse(raw["qualifies_for_verified_recommendation"])
+        self.assertFalse(raw["qualifies_for_exact_total_recommendation"])
+        self.assertIn("total_context_overrun", raw["disqualification_reasons"])
+
+        s4 = payload["summary"]["4K"]
+        self.assertEqual(s4["avg_observed_total_tokens"], 4512.0)
+        self.assertFalse(s4["effective_total_within_tier"])
+        self.assertEqual(s4["qualifying_runs"], 0)
+        self.assertEqual(s4["excluded_runs"], 1)
+        self.assertEqual(s4["cohorts"]["total_context_overrun"], 1)
+        self.assertEqual(s4["status"], "TOTAL_OVER")
+        self.assertFalse(s4["qualifies"])
+
+        rec = payload["recommendation"]
+        self.assertIsNone(rec["recommended_context"])
+        self.assertIsNone(rec["recommended_nominal_tier"])
+        self.assertIsNone(rec["recommended_nominal_context_tokens"])
+        self.assertIsNone(rec["recommended_observed_prompt_tokens"])
+        self.assertIsNone(rec["recommended_observed_total_tokens"])
+        self.assertIsNone(rec["recommended_effective_total_within_tier"])
+        self.assertFalse(rec["recommended_context_verified"])
+        self.assertEqual(rec["recommendation_status"], "none")
+        self.assertEqual(rec["verification_scope"], "none")
+        self.assertTrue(rec["strict_total_context"])
+        self.assertEqual(rec["total_overrun_tiers"], ["4K"])
+        self.assertTrue(payload["config"]["strict_total_context"])
+
+        out_text = buf.getvalue()
+        self.assertIn("ObsTot", out_text)
+        self.assertIn("4512", out_text)
+        self.assertIn("TOTAL_OVER", out_text)
+        self.assertIn("total_context_overrun=1", out_text)
+        self.assertIn("RECOMMENDATION: None", out_text)
+
+    def test_strict_total_context_accepts_exact_boundary_and_isolates_baseline(self):
+        """Under --strict-total-context, overrun 4K must not set baseline; exact 8192/8192 8K qualifies."""
+        overrun_4k = _FakeResponse(self._make_4000_plus_512_stream())
+        exact_8k = _FakeResponse(
+            _sse_lines(
+                [
+                    _delta(content="Exact "),
+                    _delta(content="8K total."),
+                    {"choices": [{"delta": {}, "finish_reason": "stop"}]},
+                    {
+                        "choices": [],
+                        "usage": {"prompt_tokens": 7680, "completion_tokens": 512},
+                    },
+                ],
+                include_done=True,
+            )
+        )
+        slow_16k = _FakeResponse(
+            _sse_lines(
+                [
+                    _delta(content="Slow "),
+                    _delta(content="16K total."),
+                    {"choices": [{"delta": {}, "finish_reason": "stop"}]},
+                    {
+                        "choices": [],
+                        "usage": {"prompt_tokens": 15872, "completion_tokens": 512},
+                    },
+                ],
+                include_done=True,
+            )
+        )
+        # 4K: 512 / 0.5s = 1024 tps (rejected TOTAL_OVER -> must NOT become baseline)
+        # 8K: 512 / 1.0s = 512 tps (first strict-qualifying baseline)
+        # 16K: 512 / 2.0s = 256 tps (-50% vs 8K baseline)
+        clock = _SequenceClock(
+            [
+                0.0, 0.1, 0.6, 0.7,
+                1.0, 1.2, 2.2, 2.3,
+                3.0, 3.2, 5.2, 5.3,
+            ]
+        )
+        fake_httpx = types.SimpleNamespace(
+            Client=_ScriptedClientFactory([overrun_4k, exact_8k, slow_16k]),
+            Timeout=lambda *a, **k: None,
+            TimeoutException=TimeoutError,
+        )
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            results_path = Path(tmpdir) / "cb06-strict-multi.json"
+            buf = io.StringIO()
+            with (
+                mock.patch.object(cb, "httpx", fake_httpx),
+                mock.patch.object(cb.time, "monotonic", side_effect=clock),
+                mock.patch.object(cb, "get_pageout_count", return_value=0),
+                mock.patch.object(cb, "get_memory_pressure", return_value=80),
+                redirect_stdout(buf),
+            ):
+                payload = cb.run_benchmark(
+                    "http://127.0.0.1:8090/v1",
+                    iterations=1,
+                    context_sizes=[4096, 8192, 16384],
+                    model_name="cb06-multi",
+                    results_file=results_path,
+                    strict_total_context=True,
+                )
+
+        self.assertEqual(payload["summary"]["4K"]["status"], "TOTAL_OVER")
+        self.assertFalse(payload["summary"]["4K"]["qualifies"])
+        self.assertEqual(payload["summary"]["8K"]["status"], "OK")
+        self.assertTrue(payload["summary"]["8K"]["qualifies"])
+        self.assertEqual(payload["summary"]["8K"]["avg_observed_total_tokens"], 8192.0)
+        self.assertTrue(payload["summary"]["8K"]["effective_total_within_tier"])
+        self.assertEqual(payload["summary"]["16K"]["status"], "-50%")
+        self.assertFalse(payload["summary"]["16K"]["qualifies"])
+
+        rec = payload["recommendation"]
+        self.assertEqual(rec["baseline_tps"], 512.0)
+        self.assertEqual(rec["recommended_context"], "8K")
+        self.assertEqual(rec["recommended_nominal_tier"], "8K")
+        self.assertEqual(rec["recommended_nominal_context_tokens"], 8192)
+        self.assertEqual(rec["recommended_observed_prompt_tokens"], 7680.0)
+        self.assertEqual(rec["recommended_observed_total_tokens"], 8192.0)
+        self.assertTrue(rec["recommended_effective_total_within_tier"])
+        self.assertEqual(
+            rec["verification_scope"], "verified_prompt_and_total_within_tier"
+        )
+        self.assertIn("<= 8192 within tier", buf.getvalue())
+
+    def test_strict_total_context_rejects_missing_completion_tokens(self):
+        """If server reports prompt_tokens but omits completion_tokens, strict mode rejects."""
+        lines = _sse_lines(
+            [
+                _delta(content="part 1 "),
+                _delta(content="part 2"),
+                {"choices": [{"delta": {}, "finish_reason": "stop"}]},
+                {"choices": [], "usage": {"prompt_tokens": 3584}},
+            ],
+            include_done=True,
+        )
+        clock = _SequenceClock([0.0, 0.2, 0.7, 0.8])
+        fake_httpx = types.SimpleNamespace(
+            Client=_ScriptedClientFactory([_FakeResponse(lines)]),
+            Timeout=lambda *a, **k: None,
+            TimeoutException=TimeoutError,
+        )
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            results_path = Path(tmpdir) / "cb06-missing-comp.json"
+            buf = io.StringIO()
+            with (
+                mock.patch.object(cb, "httpx", fake_httpx),
+                mock.patch.object(cb.time, "monotonic", side_effect=clock),
+                mock.patch.object(cb, "get_pageout_count", return_value=0),
+                mock.patch.object(cb, "get_memory_pressure", return_value=80),
+                redirect_stdout(buf),
+            ):
+                payload = cb.run_benchmark(
+                    "http://127.0.0.1:8090/v1",
+                    iterations=1,
+                    context_sizes=[4096],
+                    model_name="cb06-no-comp",
+                    results_file=results_path,
+                    strict_total_context=True,
+                )
+
+        raw = payload["raw"][0]
+        self.assertEqual(raw["observed_prompt_tokens"], 3584)
+        self.assertIsNone(raw["observed_output_tokens"])
+        self.assertIsNone(raw["observed_total_tokens"])
+        self.assertIsNone(raw["effective_total_within_tier"])
+        self.assertFalse(raw["qualifies_for_recommendation"])
+        self.assertIn("missing_total_token_usage", raw["disqualification_reasons"])
+        self.assertEqual(payload["summary"]["4K"]["status"], "UNVERIFIED")
+        self.assertIsNone(payload["recommendation"]["recommended_context"])
+
+    def test_cli_strict_total_context_flag_defaults_false_and_opts_in(self):
+        parser = cb.build_arg_parser()
+        default_args = parser.parse_args([])
+        self.assertFalse(default_args.strict_total_context)
+        opt_in_args = parser.parse_args(["--strict-total-context"])
+        self.assertTrue(opt_in_args.strict_total_context)
+
+
 if __name__ == "__main__":
     unittest.main()
