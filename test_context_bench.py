@@ -1622,5 +1622,291 @@ class TestCB06ObservedTotalContextAccounting(unittest.TestCase):
         self.assertTrue(opt_in_args.strict_total_context)
 
 
+class TestCB07ContradictoryCompletionUsage(unittest.TestCase):
+    def _make_two_frame_stream(self, *, prompt_tokens, completion_tokens, reasoning=False):
+        if reasoning:
+            gen_frames = [
+                _delta(reasoning="first thought "),
+                _delta(reasoning="second thought"),
+            ]
+        else:
+            gen_frames = [
+                _delta(content="first frame "),
+                _delta(content="second frame"),
+            ]
+        return _sse_lines(
+            [
+                *gen_frames,
+                {"choices": [{"delta": {}, "finish_reason": "stop"}]},
+                {
+                    "choices": [],
+                    "usage": {
+                        "prompt_tokens": prompt_tokens,
+                        "completion_tokens": completion_tokens,
+                    },
+                },
+            ],
+            include_done=True,
+        )
+
+    def test_cb07_prompt_4096_completion_0_with_nonempty_frames_rejected_as_unverified_in_strict_mode(
+        self,
+    ):
+        """CB07 reproduction: 2 nonempty frames + prompt_tokens=4096 + completion_tokens=0 -> UNVERIFIED."""
+        lines = self._make_two_frame_stream(prompt_tokens=4096, completion_tokens=0)
+        clock = _SequenceClock([0.0, 0.2, 0.7, 0.8])
+        fake_httpx = types.SimpleNamespace(
+            Client=_ScriptedClientFactory([_FakeResponse(lines)]),
+            Timeout=lambda *a, **k: None,
+            TimeoutException=TimeoutError,
+        )
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            results_path = Path(tmpdir) / "cb07-strict.json"
+            buf = io.StringIO()
+            with (
+                mock.patch.object(cb, "httpx", fake_httpx),
+                mock.patch.object(cb.time, "monotonic", side_effect=clock),
+                mock.patch.object(cb, "get_pageout_count", return_value=0),
+                mock.patch.object(cb, "get_memory_pressure", return_value=80),
+                redirect_stdout(buf),
+            ):
+                payload = cb.run_benchmark(
+                    "http://127.0.0.1:8090/v1",
+                    iterations=1,
+                    context_sizes=[4096],
+                    model_name="cb07-model",
+                    results_file=results_path,
+                    strict_total_context=True,
+                )
+
+        raw = payload["raw"][0]
+        self.assertEqual(raw["run_status"], "completed")
+        self.assertEqual(raw["generation_frames"], 2)
+        self.assertEqual(raw["output_tokens"], 2)
+        self.assertEqual(raw["token_source"], "sse_chunks")
+        self.assertEqual(raw["observed_prompt_tokens"], 4096)
+        self.assertEqual(raw["usage_completion_tokens"], 0)
+        self.assertIsNone(raw["observed_output_tokens"])
+        self.assertIsNone(raw["observed_total_tokens"])
+        self.assertIsNone(raw["effective_total_within_tier"])
+        self.assertFalse(raw["total_token_overrun"])
+        self.assertFalse(raw["completion_tokens_verified"])
+        self.assertTrue(raw["contradictory_completion_usage"])
+        self.assertFalse(raw["qualifies_for_recommendation"])
+        self.assertFalse(raw["qualifies_for_verified_recommendation"])
+        self.assertFalse(raw["qualifies_for_exact_total_recommendation"])
+        self.assertIn(
+            "contradictory_completion_token_usage", raw["disqualification_reasons"]
+        )
+        self.assertIn("missing_total_token_usage", raw["disqualification_reasons"])
+
+        s4 = payload["summary"]["4K"]
+        self.assertEqual(s4["observed_prompt_tokens_avg"], 4096.0)
+        self.assertIsNone(s4["observed_output_tokens_avg"])
+        self.assertIsNone(s4["avg_observed_total_tokens"])
+        self.assertIsNone(s4["max_observed_total_tokens"])
+        self.assertIsNone(s4["effective_total_within_tier"])
+        self.assertEqual(s4["qualifying_runs"], 0)
+        self.assertEqual(s4["excluded_runs"], 1)
+        self.assertEqual(s4["cohorts"]["contradictory_completion_token_usage"], 1)
+        self.assertEqual(s4["cohorts"]["missing_total_token_usage"], 1)
+        self.assertEqual(s4["status"], "UNVERIFIED")
+        self.assertFalse(s4["qualifies"])
+        self.assertFalse(s4["verified"])
+
+        rec = payload["recommendation"]
+        self.assertIsNone(rec["recommended_context"])
+        self.assertFalse(rec["recommended_context_verified"])
+        self.assertEqual(rec["recommendation_status"], "none")
+        self.assertEqual(rec["verification_scope"], "none")
+        self.assertIn("contradictory completion_tokens <= 0", rec["note"])
+
+        out_text = buf.getvalue()
+        self.assertIn("UNVERIFIED_OUTPUT(completion_tokens<=0)", out_text)
+        self.assertIn("unverif", out_text)
+        self.assertIn("UNVERIFIED", out_text)
+        self.assertIn("contradictory_completion_token_usage=1", out_text)
+        self.assertIn("RECOMMENDATION: None", out_text)
+
+    def test_cb07_contrast_completion_2_still_excludes_as_total_over_at_4098(self):
+        """Identical 2-frame stream with completion_tokens=2 is verified and rejected at 4098."""
+        lines = self._make_two_frame_stream(prompt_tokens=4096, completion_tokens=2)
+        clock = _SequenceClock([0.0, 0.2, 0.7, 0.8])
+        fake_httpx = types.SimpleNamespace(
+            Client=_ScriptedClientFactory([_FakeResponse(lines)]),
+            Timeout=lambda *a, **k: None,
+            TimeoutException=TimeoutError,
+        )
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            results_path = Path(tmpdir) / "cb07-contrast.json"
+            buf = io.StringIO()
+            with (
+                mock.patch.object(cb, "httpx", fake_httpx),
+                mock.patch.object(cb.time, "monotonic", side_effect=clock),
+                mock.patch.object(cb, "get_pageout_count", return_value=0),
+                mock.patch.object(cb, "get_memory_pressure", return_value=80),
+                redirect_stdout(buf),
+            ):
+                payload = cb.run_benchmark(
+                    "http://127.0.0.1:8090/v1",
+                    iterations=1,
+                    context_sizes=[4096],
+                    model_name="cb07-contrast",
+                    results_file=results_path,
+                    strict_total_context=True,
+                )
+
+        raw = payload["raw"][0]
+        self.assertEqual(raw["token_source"], "usage")
+        self.assertEqual(raw["observed_output_tokens"], 2)
+        self.assertEqual(raw["observed_total_tokens"], 4098)
+        self.assertTrue(raw["completion_tokens_verified"])
+        self.assertFalse(raw["contradictory_completion_usage"])
+        self.assertFalse(raw["effective_total_within_tier"])
+        self.assertTrue(raw["total_token_overrun"])
+        self.assertEqual(payload["summary"]["4K"]["status"], "TOTAL_OVER")
+        self.assertIsNone(payload["recommendation"]["recommended_context"])
+
+    def test_cb07_negative_completion_and_reasoning_frames_also_classified_unverified(self):
+        """Negative completion_tokens or reasoning-only frames with completion_tokens=0 are contradictory."""
+        cases = [
+            self._make_two_frame_stream(prompt_tokens=4096, completion_tokens=-2),
+            self._make_two_frame_stream(
+                prompt_tokens=4096, completion_tokens=0, reasoning=True
+            ),
+        ]
+        for idx, lines in enumerate(cases):
+            clock = _SequenceClock([0.0, 0.2, 0.7, 0.8])
+            fake_httpx = types.SimpleNamespace(
+                Client=_ScriptedClientFactory([_FakeResponse(lines)]),
+                Timeout=lambda *a, **k: None,
+                TimeoutException=TimeoutError,
+            )
+            with tempfile.TemporaryDirectory() as tmpdir:
+                results_path = Path(tmpdir) / f"cb07-case-{idx}.json"
+                buf = io.StringIO()
+                with (
+                    mock.patch.object(cb, "httpx", fake_httpx),
+                    mock.patch.object(cb.time, "monotonic", side_effect=clock),
+                    mock.patch.object(cb, "get_pageout_count", return_value=0),
+                    mock.patch.object(cb, "get_memory_pressure", return_value=80),
+                    redirect_stdout(buf),
+                ):
+                    payload = cb.run_benchmark(
+                        "http://127.0.0.1:8090/v1",
+                        iterations=1,
+                        context_sizes=[4096],
+                        model_name="cb07-edge",
+                        results_file=results_path,
+                        strict_total_context=True,
+                    )
+
+            raw = payload["raw"][0]
+            self.assertIsNone(raw["observed_output_tokens"], msg=f"case={idx}")
+            self.assertIsNone(raw["observed_total_tokens"], msg=f"case={idx}")
+            self.assertFalse(raw["completion_tokens_verified"], msg=f"case={idx}")
+            self.assertTrue(raw["contradictory_completion_usage"], msg=f"case={idx}")
+            self.assertEqual(payload["summary"]["4K"]["status"], "UNVERIFIED", msg=f"case={idx}")
+            self.assertFalse(payload["summary"]["4K"]["qualifies"], msg=f"case={idx}")
+            self.assertIsNone(payload["recommendation"]["recommended_context"], msg=f"case={idx}")
+
+    def test_cb07_default_mode_never_fabricates_4096_plus_0_as_verified_total(self):
+        """Even without --strict-total-context, completion_tokens=0 with output is never verified total."""
+        lines = self._make_two_frame_stream(prompt_tokens=4096, completion_tokens=0)
+        clock = _SequenceClock([0.0, 0.2, 0.7, 0.8])
+        fake_httpx = types.SimpleNamespace(
+            Client=_ScriptedClientFactory([_FakeResponse(lines)]),
+            Timeout=lambda *a, **k: None,
+            TimeoutException=TimeoutError,
+        )
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            results_path = Path(tmpdir) / "cb07-default.json"
+            buf = io.StringIO()
+            with (
+                mock.patch.object(cb, "httpx", fake_httpx),
+                mock.patch.object(cb.time, "monotonic", side_effect=clock),
+                mock.patch.object(cb, "get_pageout_count", return_value=0),
+                mock.patch.object(cb, "get_memory_pressure", return_value=80),
+                redirect_stdout(buf),
+            ):
+                payload = cb.run_benchmark(
+                    "http://127.0.0.1:8090/v1",
+                    iterations=1,
+                    context_sizes=[4096],
+                    model_name="cb07-default",
+                    results_file=results_path,
+                    strict_total_context=False,
+                )
+
+        raw = payload["raw"][0]
+        self.assertEqual(raw["observed_prompt_tokens"], 4096)
+        self.assertIsNone(raw["observed_output_tokens"])
+        self.assertIsNone(raw["observed_total_tokens"])
+        self.assertIsNone(raw["effective_total_within_tier"])
+        self.assertFalse(raw["completion_tokens_verified"])
+        self.assertTrue(raw["contradictory_completion_usage"])
+        self.assertFalse(raw["qualifies_for_exact_total_recommendation"])
+        self.assertIn("contradictory_completion_token_usage", raw["verification_warnings"])
+        self.assertIsNone(payload["summary"]["4K"]["avg_observed_total_tokens"])
+        self.assertEqual(
+            payload["recommendation"]["verification_scope"],
+            "verified_prompt_only_total_unreported",
+        )
+        self.assertIn("contradictory completion_tokens <= 0", payload["recommendation"]["note"])
+
+    def test_cb07_contradictory_4k_excluded_from_strict_baseline_while_verified_8k_qualifies(
+        self,
+    ):
+        """Under --strict-total-context, contradictory 4K does not set baseline; verified 8K qualifies."""
+        bad_4k = _FakeResponse(
+            self._make_two_frame_stream(prompt_tokens=4096, completion_tokens=0)
+        )
+        good_8k = _FakeResponse(
+            self._make_two_frame_stream(prompt_tokens=7680, completion_tokens=512)
+        )
+        # 4K: 2 / 0.1s = 20 tps (UNVERIFIED, excluded from baseline)
+        # 8K: 512 / 1.0s = 512 tps (first strict-verified baseline, total 8192 <= 8192)
+        clock = _SequenceClock([0.0, 0.1, 0.2, 0.25, 1.0, 1.2, 2.2, 2.3])
+        fake_httpx = types.SimpleNamespace(
+            Client=_ScriptedClientFactory([bad_4k, good_8k]),
+            Timeout=lambda *a, **k: None,
+            TimeoutException=TimeoutError,
+        )
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            results_path = Path(tmpdir) / "cb07-multi.json"
+            buf = io.StringIO()
+            with (
+                mock.patch.object(cb, "httpx", fake_httpx),
+                mock.patch.object(cb.time, "monotonic", side_effect=clock),
+                mock.patch.object(cb, "get_pageout_count", return_value=0),
+                mock.patch.object(cb, "get_memory_pressure", return_value=80),
+                redirect_stdout(buf),
+            ):
+                payload = cb.run_benchmark(
+                    "http://127.0.0.1:8090/v1",
+                    iterations=1,
+                    context_sizes=[4096, 8192],
+                    model_name="cb07-multi",
+                    results_file=results_path,
+                    strict_total_context=True,
+                )
+
+        self.assertEqual(payload["summary"]["4K"]["status"], "UNVERIFIED")
+        self.assertFalse(payload["summary"]["4K"]["qualifies"])
+        self.assertEqual(payload["summary"]["8K"]["status"], "OK")
+        self.assertTrue(payload["summary"]["8K"]["qualifies"])
+        rec = payload["recommendation"]
+        self.assertEqual(rec["baseline_tps"], 512.0)
+        self.assertEqual(rec["recommended_context"], "8K")
+        self.assertTrue(rec["recommended_context_verified"])
+        self.assertEqual(
+            rec["verification_scope"], "verified_prompt_and_total_within_tier"
+        )
+
+
 if __name__ == "__main__":
     unittest.main()

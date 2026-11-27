@@ -240,8 +240,40 @@ def _is_missing_prompt_usage(record):
     return False
 
 
+def _is_contradictory_completion_usage(record):
+    """Return True if a run record reports <=0 completion usage despite nonempty output."""
+    if record.get("contradictory_completion_usage") is True:
+        return True
+    if "contradictory_completion_token_usage" in (
+        record.get("disqualification_reasons") or []
+    ):
+        return True
+    if "contradictory_completion_token_usage" in (
+        record.get("verification_warnings") or []
+    ):
+        return True
+    has_frames = (record.get("generation_frames") or 0) > 0 or (
+        (record.get("content_chars") or 0) + (record.get("reasoning_chars") or 0)
+    ) > 0
+    if has_frames:
+        obs_out = record.get("observed_output_tokens")
+        if (
+            not isinstance(obs_out, bool)
+            and isinstance(obs_out, (int, float))
+            and obs_out <= 0
+        ):
+            return True
+        if record.get("completion_tokens_verified") is False:
+            return True
+    return False
+
+
 def _extract_observed_total_tokens(record):
     """Return server-observed prompt+output total tokens from a run record, or None."""
+    if _is_contradictory_completion_usage(record):
+        return None
+    if record.get("completion_tokens_verified") is False:
+        return None
     total = _parse_token_count(record.get("observed_total_tokens"))
     if total is not None:
         return total
@@ -276,6 +308,8 @@ def _error_result(
         "total_s": None,
         "output_tokens": 0,
         "observed_output_tokens": None,
+        "completion_tokens_verified": False,
+        "contradictory_completion_usage": False,
         "requested_output_tokens": requested_output_tokens,
         "requested_context_tokens": requested_context_tokens,
         "requested_prompt_tokens": requested_prompt_tokens,
@@ -456,11 +490,14 @@ def run_single_test(
     total_time = max(end - start, 0.0)
     ttft = (first_any_time - start) if first_any_time is not None else None
 
-    # Server-reported counts are authoritative when present; chunk counts are fallback.
+    # Server-reported counts are authoritative when present and non-contradictory;
+    # chunk counts are fallback. Reporting completion_tokens <= 0 despite nonempty
+    # generated frames/text is contradictory and never treated as verified usage.
     chunk_total = content_chunks + reasoning_chunks
-    usage_completion_tokens = _parse_token_count(
+    raw_completion_tokens = (
         usage.get("completion_tokens") if isinstance(usage, dict) else None
     )
+    usage_completion_tokens = _parse_token_count(raw_completion_tokens)
     usage_prompt_tokens = _parse_token_count(
         usage.get("prompt_tokens") if isinstance(usage, dict) else None
     )
@@ -473,10 +510,29 @@ def run_single_test(
         else None
     )
 
-    if usage_completion_tokens is not None and (
-        usage_completion_tokens > 0 or chunk_total == 0
+    has_generated_frames = (
+        generation_frames > 0 or (content_chars + reasoning_chars) > 0
+    )
+    contradictory_completion_usage = (
+        has_generated_frames
+        and not isinstance(raw_completion_tokens, bool)
+        and isinstance(raw_completion_tokens, (int, float))
+        and raw_completion_tokens <= 0
+    )
+    verified_usage_completion_tokens = (
+        usage_completion_tokens
+        if (
+            usage_completion_tokens is not None
+            and not contradictory_completion_usage
+        )
+        else None
+    )
+    completion_tokens_verified = verified_usage_completion_tokens is not None
+
+    if verified_usage_completion_tokens is not None and (
+        verified_usage_completion_tokens > 0 or chunk_total == 0
     ):
-        output_tokens = int(usage_completion_tokens)
+        output_tokens = int(verified_usage_completion_tokens)
         token_source = "usage"
     else:
         output_tokens = chunk_total
@@ -569,12 +625,15 @@ def run_single_test(
     )
 
     # Combined prompt + completion total token accounting (separate from prompt-tier
-    # tolerance verification).
+    # tolerance verification). Contradictory completion_tokens (<= 0 despite nonempty
+    # generated frames/text) is never trusted as verified completion usage.
     observed_prompt_int = (
         int(usage_prompt_tokens) if usage_prompt_tokens is not None else None
     )
     observed_output_int = (
-        int(usage_completion_tokens) if usage_completion_tokens is not None else None
+        int(verified_usage_completion_tokens)
+        if verified_usage_completion_tokens is not None
+        else None
     )
     observed_total_tokens = (
         observed_prompt_int + observed_output_int
@@ -608,6 +667,11 @@ def run_single_test(
             verification_warnings.append("missing_prompt_token_usage")
         else:
             disqualification_reasons.append("missing_prompt_token_usage")
+    if contradictory_completion_usage and error_msg is None:
+        if strict_total_context:
+            disqualification_reasons.append("contradictory_completion_token_usage")
+        else:
+            verification_warnings.append("contradictory_completion_token_usage")
     if total_token_overrun:
         if strict_total_context:
             disqualification_reasons.append("total_context_overrun")
@@ -629,7 +693,9 @@ def run_single_test(
         qualifies_for_recommendation and prompt_tokens_verified
     )
     qualifies_for_exact_total_recommendation = (
-        qualifies_for_verified_recommendation and (effective_total_within_tier is True)
+        qualifies_for_verified_recommendation
+        and completion_tokens_verified
+        and (effective_total_within_tier is True)
     )
 
     rounded_ttft = round(ttft, 3) if ttft is not None else None
@@ -645,6 +711,8 @@ def run_single_test(
         "total_s": round(total_time, 3),
         "output_tokens": output_tokens,
         "observed_output_tokens": observed_output_int,
+        "completion_tokens_verified": completion_tokens_verified,
+        "contradictory_completion_usage": contradictory_completion_usage,
         "requested_output_tokens": req_output_tokens,
         "requested_context_tokens": requested_context_tokens,
         "requested_prompt_tokens": requested_prompt_tokens,
@@ -692,6 +760,8 @@ def run_single_test(
         )
     if usage is not None:
         out["usage_prompt_tokens"] = usage.get("prompt_tokens")
+        if "completion_tokens" in usage:
+            out["usage_completion_tokens"] = usage.get("completion_tokens")
     if cached_prompt_tokens is not None:
         out["cached_prompt_tokens"] = cached_prompt_tokens
     return out
@@ -749,8 +819,17 @@ def summarize_context_runs(ctx_size, iter_results, requested_prompt_tokens=None)
         [r.get("observed_prompt_tokens") for r in iter_results], ndigits=1
     )
     observed_output_avg = _avg(
-        [r.get("observed_output_tokens") for r in iter_results], ndigits=1
+        [
+            None if _is_contradictory_completion_usage(r) else r.get("observed_output_tokens")
+            for r in iter_results
+        ],
+        ndigits=1,
     )
+    contradictory_completion_usage = [
+        r
+        for r in iter_results
+        if not r.get("error") and _is_contradictory_completion_usage(r)
+    ]
     observed_totals = [_extract_observed_total_tokens(r) for r in iter_results]
     valid_observed_totals = [t for t in observed_totals if t is not None]
     avg_observed_total_tokens = _avg(valid_observed_totals, ndigits=1)
@@ -880,6 +959,7 @@ def summarize_context_runs(ctx_size, iter_results, requested_prompt_tokens=None)
             "missing_prompt_token_usage": len(missing_prompt_usage),
             "total_context_overrun": len(total_overrun),
             "missing_total_token_usage": len(missing_total_usage),
+            "contradictory_completion_token_usage": len(contradictory_completion_usage),
         },
         "truncated_cohort": truncated_cohort,
     }
@@ -912,6 +992,8 @@ def evaluate_summary(
     recommended_effective_total_within_tier = None
     swap_telemetry_available = False
     unverified_tiers = []
+    unverified_total_tiers = []
+    contradictory_completion_tiers = []
     total_overrun_tiers = []
     row_evaluations = {}
 
@@ -949,10 +1031,19 @@ def evaluate_summary(
         if has_total_overrun:
             total_overrun_tiers.append(label)
 
+        has_contradictory_completion = (
+            cohorts.get("contradictory_completion_token_usage", 0) > 0
+        )
+        if has_contradictory_completion:
+            contradictory_completion_tiers.append(label)
+
         has_missing_total_strict = strict_total_context and (
             cohorts.get("missing_total_token_usage", 0) > 0
+            or has_contradictory_completion
             or (data.get("runs", 0) > 0 and eff_total_within is None)
         )
+        if has_missing_total_strict:
+            unverified_total_tiers.append(label)
         blocked_by_strict_total = strict_total_context and (
             has_total_overrun or has_missing_total_strict
         )
@@ -988,7 +1079,7 @@ def evaluate_summary(
             row_evaluations[label] = {
                 "status": status,
                 "qualifies": False,
-                "verified": not row_unverified,
+                "verified": not (row_unverified or has_missing_total_strict),
                 "effective_total_within_tier": eff_total_within,
                 "tps_drop_pct": None,
             }
@@ -1090,11 +1181,17 @@ def evaluate_summary(
             )
         else:
             verification_scope = "verified_prompt_only_total_unreported"
+            detail = (
+                "server reported contradictory completion_tokens <= 0 despite "
+                "non-empty output; combined total unverified"
+                if recommended in contradictory_completion_tiers
+                else "combined prompt+completion total not reported by server"
+            )
             note = (
                 f"Highest verified qualifying nominal tier ({recommended}) with "
                 f"server-reported prompt_tokens within tolerance, "
                 f"<={TPS_DROP_THRESHOLD_PCT:.0f}% streaming decode TPS drop, and "
-                f"{swap_note} (combined prompt+completion total not reported by server)."
+                f"{swap_note} ({detail})."
             )
     elif recommended:
         recommendation_status = "unverified"
@@ -1118,6 +1215,25 @@ def evaluate_summary(
                 f"requires observed_prompt_tokens + observed_output_tokens <= "
                 f"requested_context_tokens)."
             )
+        elif strict_total_context and unverified_total_tiers:
+            unv_tot_str = ", ".join(unverified_total_tiers)
+            if contradictory_completion_tiers:
+                contra_str = ", ".join(contradictory_completion_tiers)
+                note = (
+                    f"No tested context size met strict-total-context qualification "
+                    f"criteria. Server reported contradictory completion_tokens <= 0 "
+                    f"despite non-empty generated output on tier(s) [{contra_str}] "
+                    f"(unverified total usage on [{unv_tot_str}]; --strict-total-context "
+                    f"requires verified server prompt_tokens and completion_tokens)."
+                )
+            else:
+                note = (
+                    f"No tested context size met strict-total-context qualification "
+                    f"criteria. Server omitted verified combined prompt+completion "
+                    f"token usage on tier(s) [{unv_tot_str}] (--strict-total-context "
+                    f"requires verified observed_prompt_tokens + observed_output_tokens "
+                    f"<= requested_context_tokens)."
+                )
         elif unverified_tiers:
             tiers_str = ", ".join(unverified_tiers)
             note = (
@@ -1285,6 +1401,8 @@ def run_benchmark(
                     _flags.append(
                         f"UNVERIFIED_SIZE(est~{result.get('requested_prompt_tokens')})"
                     )
+                if result.get("contradictory_completion_usage"):
+                    _flags.append("UNVERIFIED_OUTPUT(completion_tokens<=0)")
                 if result.get("total_token_overrun"):
                     _flags.append(
                         f"TOTAL_OVER(obs={result.get('observed_total_tokens')}/{ctx_size})"
@@ -1439,12 +1557,22 @@ def run_benchmark(
         "missing_prompt_token_usage",
     ]
     if strict_total_context:
-        cohort_keys.extend(["total_context_overrun", "missing_total_token_usage"])
+        cohort_keys.extend(
+            [
+                "total_context_overrun",
+                "missing_total_token_usage",
+                "contradictory_completion_token_usage",
+            ]
+        )
 
     for label, data in results.items():
         status = data["status"]
         cohorts = data.get("cohorts") or {}
         is_unverified_row = cohorts.get("missing_prompt_token_usage", 0) > 0
+        is_unverified_total = (
+            cohorts.get("contradictory_completion_token_usage", 0) > 0
+            or (strict_total_context and cohorts.get("missing_total_token_usage", 0) > 0)
+        )
         if is_unverified_row:
             any_unverified_row = True
         if status == "OK (tot>tier)":
@@ -1454,7 +1582,7 @@ def run_benchmark(
         obs_in_str = _fmt_opt(
             data.get("observed_prompt_tokens_avg"), "{:.0f}", empty=obs_in_empty
         )
-        obs_tot_empty = "unverif" if is_unverified_row else "—"
+        obs_tot_empty = "unverif" if (is_unverified_row or is_unverified_total) else "—"
         obs_tot_str = _fmt_opt(
             data.get("avg_observed_total_tokens"), "{:.0f}", empty=obs_tot_empty
         )

@@ -96,8 +96,9 @@ Every run is classified into an explicit `run_status` before any aggregation:
     and `verification_scope="verified_prompt_tier_only"` (distinct from
     `"verified_prompt_and_total_within_tier"`).
   - Pass `--strict-total-context` for exact-total tier comparisons: any tier
-    whose combined `observed_total_tokens` exceeds `requested_context_tokens`
-    (or omits total usage) is disqualified as `TOTAL_OVER` (or `UNVERIFIED`)
+    whose combined `observed_total_tokens` exceeds `requested_context_tokens`,
+    omits total usage, or reports contradictory `completion_tokens <= 0` despite
+    non-empty generated frames is disqualified as `TOTAL_OVER` (or `UNVERIFIED`)
     rather than qualifying for `recommended_context`.
 - **Missing server token usage (fail-closed by default)**: if an endpoint omits
   `usage.prompt_tokens` (so `observed_prompt_tokens` is `null`), streaming
