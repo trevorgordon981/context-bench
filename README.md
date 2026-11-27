@@ -1,210 +1,211 @@
 # context-bench
 
-A simple benchmark for characterizing the safe operating range of a local LLM
-serving endpoint (MLX, vLLM, llama.cpp, or anything speaking an OpenAI-compatible
-`/v1/chat/completions` API) across context-window sizes.
+A lightweight benchmark for characterizing the safe operating range of an
+OpenAI-compatible LLM serving endpoint (MLX, vLLM, llama.cpp, or any server
+exposing `/v1/chat/completions`) across context-window sizes.
 
 ## Overview
 
 `context-bench.py` sweeps a configurable set of context sizes (default:
-4k, 8k, 16k, 32k, 64k, 96k, 128k tokens), issues streaming chat-completion
-requests at each size, and records:
+4K, 8K, 16K, 32K, 64K, 96K, 128K tokens), issues streaming chat-completion
+requests at each size, and separates valid streaming measurements from buffered,
+empty, truncated, token-mismatched, or failed responses.
 
-- **Time-to-first-token (TTFT)** — prefill latency
-- **Tokens/sec during decode** — steady-state throughput
-- **Total wall time per request**
-- **Peak memory pressure** — macOS `memory_pressure` free-percentage deltas
-- **Page-out counts** — swap activity via `vm_stat`, a proxy for memory exhaustion
+## Metric Definitions
 
-The tool is most useful before putting a new model deployment into production:
-run it once to learn where throughput drops off a cliff and where the OS starts
-swapping, then set your serving layer's `max_context` accordingly.
+Every iteration record in `raw` and aggregated tier in `summary` uses explicit
+client-side definitions:
 
-## Reasoning models
+- **Client-observed TTFT (`client_ttft_s` / `ttft_s`)** — wall time from HTTP
+  request dispatch (after `httpx.Client` creation) to the first nonempty
+  generation frame (`reasoning`, `reasoning_content`, or `content`). Because
+  this is measured at the client, it includes TCP/TLS/HTTP overhead, server
+  queueing, and prompt prefill. Returns `null` if zero output tokens arrive.
+- **Content TTFT (`client_ttft_content_s` / `ttft_content_s`)** — wall time from
+  dispatch to the first `content` frame, reported alongside `client_ttft_s` so
+  reasoning-model think time is not confused with prefill latency.
+- **Streaming decode TPS (`tokens_per_sec` / `avg_tps`)** — computed strictly as
+  `output_tokens / (last_gen_time - first_gen_time)` across distinct nonempty
+  generation frames, **only when** `generation_frames >= 2` and the observed
+  inter-frame span is at least `--min-decode-interval` (default `0.01` s / 10 ms).
+  Single-frame buffered completions, zero-output completions, and sub-threshold
+  coalesced bursts report `null` (`N/A` in console output) with an explicit
+  `decode_tps_exclusion_reason` instead of dividing by stream teardown time.
+- **End-to-end throughput (`end_to_end_tokens_per_sec` / `avg_e2e_tps`)** —
+  `output_tokens / total_s`, reported separately from streaming decode TPS so
+  buffered responses still retain honest overall throughput without polluting
+  decode-rate curves.
+- **Total request wall time (`total_s`)** — elapsed time from request dispatch
+  to stream close.
+- **Local-host memory snapshots (`host_mem_free_pct_before`, `host_mem_free_pct_after`)** —
+  macOS `memory_pressure -Q` free-memory percentages sampled before and after
+  each request **only** when targeting a local loopback endpoint (`127.0.0.1`,
+  `localhost`, `::1`, `0.0.0.0`). On Linux or remote endpoints, these fields are
+  `null` (`N/A`). They do **not** measure peak intra-request memory pressure or
+  remote GPU VRAM.
+- **Local-host page-out delta (`host_pageouts_delta` / `avg_host_pageouts`)** —
+  macOS `vm_stat` page-out delta sampled before and after each request on local
+  loopback endpoints only. Returns `null` (`N/A`) when unavailable or targeting
+  a remote endpoint — never `0` as a fallback.
 
-Servers stream chain-of-thought on a **separate delta field** — `reasoning` or
-`reasoning_content` — not on `content`. A benchmark that counts only `content`
-silently breaks three metrics at once on any reasoning model:
+## Stream Outcomes, Cohorts, and Safe-Context Gating
 
-- **`output_tokens`** undercounts by however much the model thought
-- **`tokens_per_sec`** is computed over that undercount, so decode throughput
-  reads far lower than it actually is
-- **TTFT** — the worst of the three — fires on the first *content* token, so the
-  entire thinking phase gets billed as prefill latency
+Every run is classified into an explicit `run_status` before any aggregation:
 
-Measured on `deepseek-v4-flash` at 4k context: `reasoning_len 9359` vs
-`content_len 537`. About 95% of generated tokens were invisible to a content-only
-counter, and TTFT read ~90s instead of ~1s.
+- `completed`: terminated cleanly (`[DONE]` or normal `finish_reason` in
+  `stop`/`eos`/`end_turn`) with nonempty generated output.
+- `length_limited`: terminated with `finish_reason="length"` (`truncated=true`).
+- `no_output`: terminated (`[DONE]` or `finish_reason`) with zero generated
+  output (treated as a failure, never a valid 0-TPS sample).
+- `incomplete`: HTTP 200 stream closed before `[DONE]` or `finish_reason`.
+- `other_finish`: terminated with a non-standard `finish_reason` (e.g.
+  `content_filter`).
+- `error`: HTTP non-200 status, timeout, or transport failure.
 
-This tool therefore reports **TTFT as the first token of either kind** (true
-prefill), with `ttft_content_s` alongside it for the answer-latency question, and
-counts reasoning and content separately (`reasoning_chars`, `content_chars`,
-`reasoning_share`).
+### Prompt Token Tolerance & Cache Modes
 
-### Pinning the thinking mode
+- **Requested vs. observed tokens**: each row records `requested_context_tokens`,
+  `requested_prompt_tokens`, `requested_output_tokens`, `observed_prompt_tokens`,
+  and `observed_output_tokens`. When the server reports `usage.prompt_tokens`,
+  the benchmark verifies both relative tolerance (`--prompt-token-tolerance`,
+  default `±25%`) and that `observed_prompt_tokens <= requested_context_tokens`.
+  Out-of-tolerance or over-budget rows set `prompt_token_mismatch=true`.
+- **Cold vs. warm sweeps (`--cache-mode`)**:
+  - `cold` (default) prepends a unique `[Benchmark Request ID: ...]` nonce to
+    each iteration's prompt so prefix KV caches cannot mask true prefill latency.
+  - `warm` sends identical prompt text across iterations at a given size so you
+    can intentionally measure prefix-cache-warmed sweeps.
+  - Every run records `request_id`, `cache_mode`, `prompt_sha256`, and (when
+    reported by the server) `cached_prompt_tokens`, and sends `X-Request-Id`.
 
-There is **no portable switch** for reasoning. The key *and its default* are
-vendor-specific:
+### Safe-Context Recommendation Rules
 
-| family          | `chat_template_kwargs` key | default |
-|-----------------|----------------------------|---------|
-| DeepSeek, Qwen  | `enable_thinking`          | off     |
-| MiniMax         | `thinking_mode`            | on      |
+All rows remain visible in `raw`, `summary[label].cohorts`, and the console
+table. However, a context tier can only qualify for `recommended_context` when:
 
-Benchmarking without pinning it compares a thinking run against a non-thinking one
-and calls the difference throughput. Use:
+1. It has at least one qualifying `completed` run with measurable positive
+   streaming decode TPS (`avg_tps > 0`).
+2. It has zero `length_limited` (truncated) and zero `prompt_token_mismatch`
+   runs.
+3. Its `avg_tps` drops by no more than `15%` from the first qualifying baseline
+   tier (unmeasurable or zero-output rows never establish or disable the
+   baseline).
+4. Measured local host page-outs do not exceed `100` (when host swap telemetry
+   is unavailable, the recommendation explicitly notes that swap pressure was
+   not verified).
+
+If no tested tier meets all criteria, the benchmark reports
+`RECOMMENDATION: None` rather than defaulting to `4K`.
+
+## Reasoning Models
+
+Servers stream chain-of-thought on a separate delta field (`reasoning` or
+`reasoning_content`) rather than `content`. Counting only `content` undercounts
+output tokens, underreports decode TPS, and bills the entire thinking phase to
+TTFT. `context-bench.py` counts both fields, reports `client_ttft_s` at the
+first token of either kind, reports `client_ttft_content_s` separately, and
+records `reasoning_chars`, `content_chars`, and `reasoning_share`.
+
+### Pinning the Thinking Mode
+
+There is no portable switch for reasoning across model families:
+
+| Family         | `chat_template_kwargs` key | Default |
+|----------------|----------------------------|---------|
+| DeepSeek, Qwen | `enable_thinking`          | off     |
+| MiniMax        | `thinking_mode`            | on      |
 
 ```bash
-# force reasoning ON for a DeepSeek/Qwen endpoint
-./context-bench.py --think on --think-style deepseek
+# Force reasoning ON for a DeepSeek/Qwen endpoint
+python3 context-bench.py --think on --think-style deepseek
 
-# force it OFF for MiniMax
-./context-bench.py --think off --think-style minimax
+# Force reasoning OFF for MiniMax
+python3 context-bench.py --think off --think-style minimax
 
-# or pass the kwargs verbatim
-./context-bench.py --think-kwargs '{"enable_thinking": true}'
+# Pass raw JSON kwargs verbatim
+python3 context-bench.py --think-kwargs '{"enable_thinking": true}'
 ```
 
-The kwargs actually sent are recorded on every result row as `think_kwargs`, so a
-results file always says which mode produced it.
-
-### Token counts and truncation
-
-Counts come from the server's own `usage` block where available (requested via
-`stream_options.include_usage`); `token_source` reports `usage` or `sse_chunks` so
-you know whether a number is exact or estimated. `finish_reason` is recorded, and
-`truncated` flags any run cut off at `max_tokens` — a truncated run is not
-comparable to one that stopped on its own, and at large context sizes truncation
-becomes common enough to distort an average silently.
-
-## Design
-
-The benchmark constructs prompts by repeating a fixed **filler block** of generic
-transformer-architecture prose until the target token count is reached. This
-approach was chosen deliberately over random tokens or real documents because:
-
-1. **Consistent tokenization** — the same text across runs means the same token
-   count across runs, eliminating tokenizer variance between model families.
-2. **Bounded memory growth** — filler content is semantically coherent English,
-   which avoids pathological tokenizer behavior (e.g. byte-fallback explosions
-   on random bytes) that would skew memory-pressure measurements.
-3. **Reproducibility** — no external corpus required; the benchmark is
-   self-contained and deterministic across machines.
-
-The prompt uses a rough `3.5 chars/token` heuristic to size the filler; actual
-token counts will vary by tokenizer but are consistent within a single run.
-
-Memory metrics rely on macOS-specific commands (`memory_pressure`, `vm_stat`).
-On Linux the benchmark still runs — throughput numbers are accurate — but those
-fields will be `None` / `0`.
+The kwargs sent are recorded on every result row (`think_kwargs`) and in
+`config.think_kwargs`.
 
 ## Usage
 
 ```bash
 pip install -r requirements.txt
 
-# Default: hits http://127.0.0.1:8090/v1, model name "default", 3 iterations
-python context-bench.py
+# Offline synthetic mock-SSE demo (no LLM server required)
+python3 context-bench.py --demo
 
-# Point at your endpoint and model
-python context-bench.py \
+# Default: hits http://127.0.0.1:8090/v1, model "default", 3 cold iterations
+python3 context-bench.py
+
+# Point at your endpoint and model with custom sizes and cache mode
+python3 context-bench.py \
     --api-url http://127.0.0.1:8080/v1 \
     --model my-model-name \
-    --iterations 5
-
-# Custom context sizes (in K tokens)
-python context-bench.py --sizes 4,8,16,32,64
-
-# Write results somewhere specific
-python context-bench.py --results-file /tmp/bench.json
+    --sizes 4,8,16,32,64 \
+    --iterations 5 \
+    --cache-mode cold \
+    --results-file /tmp/bench.json
 ```
 
-The default API URL assumes your serving endpoint exposes an OpenAI-compatible
-chat-completions API on port `8090`. Override via `--api-url` or the `API_URL`
-environment variable. Override the model name via `--model` or the `MODEL_NAME`
-environment variable — this is the string sent as the `model` field in the
-request body (many local servers accept anything, but some require an exact
-match).
+### Synthetic Mock-SSE Demo
 
-## Expected Output
+Run the built-in offline demo to inspect the full report format and gating
+behavior without starting a live inference server:
 
-A console summary table plus a JSON report with the fields below.
-
-**The numbers in this block are illustrative placeholders, not measurements.**
-They exist to show the shape of the report. Do not cite them as results for any
-model or machine. Real figures depend entirely on the model, the quantisation,
-the serving engine, and the hardware.
-
-```json
-{
-  "timestamp": "2026-04-05T12:34:56",
-  "config": {
-    "api_url": "...",
-    "model": "...",
-    "iterations": 3,
-    "output_tokens": 512,
-    "context_sizes": [4096, 8192, ...]
-  },
-  "summary": {
-    "4K": {
-      "context_size": 4096,
-      "avg_ttft_s": 0.42,          // placeholder value
-      "avg_tps": 58.3,            // placeholder value
-      "avg_total_s": 9.1,         // placeholder value
-      "avg_pageouts": 0,
-      "failures": 0,
-      "runs": 3
-    },
-    ...
-  },
-  "raw": [ /* per-iteration records */ ]
-}
+```bash
+python3 context-bench.py --demo --results-file /tmp/context-bench-demo.json
 ```
 
-<!-- TODO(trevor): no real measured sweep is published here yet.
-     Probed 2026-10-08: 127.0.0.1:8090 was not listening on the laptop or on
-     bat-studio (8082/8090 both refused; 8091/8095 answered 401, those are the
-     gateway). Once the MLX endpoint is back up, run:
-         python context-bench.py --sizes 4,16,32,64,120 --iterations 3 \
-             --model <served-model-id> --results-file results-macstudio.json
-     then add a "Measured results" section naming the hardware (Mac Studio
-     M3 Ultra 512GB) and the exact model and quantisation. Note the caveat
-     below about avg_tps before publishing any number from it. -->
+The demo starts a local ephemeral mock OpenAI SSE server on `127.0.0.1` and
+sweeps five synthetic scenarios (`4K`, `8K`, `16K`, `32K`, `64K`):
 
-<!-- CAVEAT(trevor): avg_tps is computed as output_tokens / (total_s - ttft_s)
-     at context-bench.py:226. If the server buffers the whole completion into
-     one chunk instead of streaming, ttft_s collapses onto total_s, the
-     denominator goes to ~0, and avg_tps explodes. That is exactly what
-     alfred-infra/context-bench-results.json shows: avg_total_s minus
-     avg_ttft_s is 0.02s on every row, and avg_tps reads ~11,000 on a Mac
-     Studio, which is not a real decode rate. Confirm the run actually
-     streamed before trusting avg_tps. -->
+- `4K` / `8K`: normal multi-frame streaming (`OK`, recommends `8K`)
+- `16K`: buffered single-frame completion (`DecTPS=N/A`, `E2ETPS` still shown, `NO_DECODE`)
+- `32K`: `finish_reason=length` + 2x prompt-token overrun (`TRUNC+SIZE`, excluded from recommendation, preserved in census)
+- `64K`: >15% streaming decode throughput drop (not recommended)
 
-## Interpretation
+## Report Schema
 
-What you're looking for in the summary table:
+The JSON report includes full run configuration (`benchmark_host`,
+`endpoint_host`, `endpoint_is_local`, `cache_mode`, `prompt_token_tolerance`,
+`min_decode_interval_s`, `memory_telemetry`), a top-level `recommendation`
+object, per-size `summary` cohorts and exclusions, and all per-iteration `raw`
+records.
 
-- **Monotonic throughput decay** — TPS gently trending down as context grows is
-  normal and expected; KV-cache attention is O(N) per token at decode time.
-- **Sudden TPS cliff** — a step-change drop (e.g. 60 TPS → 8 TPS) between two
-  adjacent sizes usually means one of:
-  - **OOM / swap thrashing** — check `avg_pageouts`; non-zero values indicate
-    the working set no longer fits in RAM and the OS is paging.
-  - **Prefill saturation** — the model's attention kernels are falling off a
-    hardware-friendly tile size, or the KV cache is crossing a buffer boundary.
-- **Failures at large sizes** — the serving layer is rejecting prompts above
-  some configured `max_context`. Check your server logs.
-- **Recommendation line** — the tool prints the largest tested size with
-  <15% throughput drop from baseline and no swap pressure, as a starting point
-  for production configuration.
+## Methodology Limits
 
-## Related projects
+- **Heuristic prompt sizing**: filler prompts use a `3.5 chars/token` heuristic
+  for repeated English technical prose. Actual token counts vary by tokenizer;
+  rely on `observed_prompt_tokens` (from server `usage`) and the tolerance gate
+  to confirm requested vs. actual prompt sizes.
+- **Client-side timing**: `client_ttft_s` includes network and queueing latency
+  in addition to server prefill. For pure server-side prefill timing, pair with
+  engine telemetry.
+- **Host-local memory snapshots only**: macOS `memory_pressure` and `vm_stat`
+  capture pre/post snapshots of the benchmark runner host only when the endpoint
+  is local loopback. They cannot observe peak intra-request allocations or
+  remote GPU/host memory.
+- **Repeated-prose compressibility**: synthetic filler prose is deterministic
+  and avoids byte-fallback tokenizer explosions, but its KV/attention behavior
+  may differ from high-entropy code or multilingual workloads.
+
+## Running Tests
+
+```bash
+python3 test_reasoning_parsing.py
+python3 -m unittest discover -s . -p "test_*.py" -v
+```
+
+## Related Projects
 
 Part of a self-hosted LLM operations toolkit:
 
-- [blockops-proxy](https://github.com/trevorgordon981/blockops-proxy) — the proxy layer whose MAX_CONCURRENT and context thresholds this benchmark helps tune
-- [llm-otel-proxy](https://github.com/trevorgordon981/llm-otel-proxy) — metrics proxy that tracks the exact same tokens/latency dimensions in production
-- [alfred-infra](https://github.com/trevorgordon981/alfred-infra) — dashboards/monitoring for the infrastructure this benchmark characterizes
+- [blockops-proxy](https://github.com/trevorgordon981/blockops-proxy) — proxy layer whose concurrency and context thresholds this benchmark helps tune
+- [llm-otel-proxy](https://github.com/trevorgordon981/llm-otel-proxy) — metrics proxy tracking tokens and latency dimensions in production
+- [alfred-infra](https://github.com/trevorgordon981/alfred-infra) — dashboards and monitoring for local LLM infrastructure
 - [alfred-rag](https://github.com/trevorgordon981/alfred-rag) — RAG stack that benefits from knowing the safe operating context range
 
 ## License

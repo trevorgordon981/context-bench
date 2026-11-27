@@ -70,12 +70,23 @@ class _ScriptedClientFactory:
             def __exit__(self, *a):
                 return False
 
-            def stream(self, method, url, json=None):
+            def stream(self, method, url, json=None, **extra):
                 resp = factory._responses[factory._index]
                 factory._index += 1
                 return resp
 
         return _Client()
+
+
+class _SteppingClock:
+    def __init__(self, step=0.05):
+        self.now = 100.0
+        self.step = step
+
+    def __call__(self):
+        val = self.now
+        self.now += self.step
+        return val
 
 
 class TestSSEStreamTermination(unittest.TestCase):
@@ -99,6 +110,7 @@ class TestSSEStreamTermination(unittest.TestCase):
 
         self.assertTrue(result["truncated"])
         self.assertIsNone(result["finish_reason"])
+        self.assertEqual(result["run_status"], "incomplete")
         self.assertIn("error", result)
         self.assertTrue(result["error"])
         self.assertEqual(result["content_chars"], len("partial output"))
@@ -109,6 +121,7 @@ class TestSSEStreamTermination(unittest.TestCase):
 
         self.assertTrue(result["truncated"])
         self.assertIsNone(result["finish_reason"])
+        self.assertEqual(result["run_status"], "incomplete")
         self.assertIn("error", result)
         self.assertTrue(result["error"])
 
@@ -126,6 +139,7 @@ class TestSSEStreamTermination(unittest.TestCase):
 
         self.assertNotIn("error", result)
         self.assertFalse(result["truncated"])
+        self.assertEqual(result["run_status"], "completed")
         self.assertEqual(result["finish_reason"], "stop")
         self.assertEqual(result["output_tokens"], 2)
         self.assertEqual(result["token_source"], "usage")
@@ -142,6 +156,7 @@ class TestSSEStreamTermination(unittest.TestCase):
 
         self.assertNotIn("error", result)
         self.assertFalse(result["truncated"])
+        self.assertEqual(result["run_status"], "completed")
         self.assertEqual(result["finish_reason"], "stop")
 
     def test_stream_with_done_without_finish_reason_succeeds(self):
@@ -153,6 +168,7 @@ class TestSSEStreamTermination(unittest.TestCase):
 
         self.assertNotIn("error", result)
         self.assertFalse(result["truncated"])
+        self.assertEqual(result["run_status"], "completed")
         self.assertIsNone(result["finish_reason"])
         self.assertEqual(result["output_tokens"], 2)
 
@@ -163,9 +179,13 @@ class TestSSEStreamTermination(unittest.TestCase):
         complete_resp = _FakeResponse(
             _sse_lines(
                 [
-                    _delta(content="done"),
+                    _delta(content="done "),
+                    _delta(content="cleanly"),
                     {"choices": [{"delta": {}, "finish_reason": "stop"}]},
-                    {"choices": [], "usage": {"completion_tokens": 4, "prompt_tokens": 100}},
+                    {
+                        "choices": [],
+                        "usage": {"completion_tokens": 4, "prompt_tokens": 3584},
+                    },
                 ],
                 include_done=True,
             )
@@ -190,6 +210,7 @@ class TestSSEStreamTermination(unittest.TestCase):
             buf = io.StringIO()
             with (
                 mock.patch.object(cb, "httpx", fake_httpx),
+                mock.patch.object(cb.time, "monotonic", side_effect=_SteppingClock(0.05)),
                 mock.patch.object(cb, "get_pageout_count", return_value=0),
                 mock.patch.object(cb, "get_memory_pressure", return_value=80),
                 redirect_stdout(buf),
@@ -207,12 +228,15 @@ class TestSSEStreamTermination(unittest.TestCase):
         # 4K had 1 incomplete stream and 1 valid stream -> only 1 run counted, 1 failure
         summary_4k = payload["summary"]["4K"]
         self.assertEqual(summary_4k["runs"], 1)
+        self.assertEqual(summary_4k["qualifying_runs"], 1)
         self.assertEqual(summary_4k["failures"], 1)
         self.assertIsNotNone(summary_4k["avg_ttft_s"])
+        self.assertIsNotNone(summary_4k["avg_tps"])
 
         # 8K had 2 incomplete streams -> 0 runs counted, 2 failures, None averages
         summary_8k = payload["summary"]["8K"]
         self.assertEqual(summary_8k["runs"], 0)
+        self.assertEqual(summary_8k["qualifying_runs"], 0)
         self.assertEqual(summary_8k["failures"], 2)
         self.assertIsNone(summary_8k["avg_ttft_s"])
         self.assertIsNone(summary_8k["avg_tps"])
@@ -229,7 +253,7 @@ class TestSSEStreamTermination(unittest.TestCase):
 
         # Console output reports FAILED for incomplete rows and FAIL for 8K summary
         output_text = buf.getvalue()
-        self.assertIn("FAILED: Incomplete SSE stream", output_text)
+        self.assertIn("FAILED (incomplete): Incomplete SSE stream", output_text)
         self.assertIn("RECOMMENDATION: 4K context window", output_text)
 
 
