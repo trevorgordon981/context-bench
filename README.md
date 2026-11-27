@@ -66,10 +66,22 @@ Every run is classified into an explicit `run_status` before any aggregation:
 
 - **Requested vs. observed tokens**: each row records `requested_context_tokens`,
   `requested_prompt_tokens`, `requested_output_tokens`, `observed_prompt_tokens`,
-  and `observed_output_tokens`. When the server reports `usage.prompt_tokens`,
-  the benchmark verifies both relative tolerance (`--prompt-token-tolerance`,
-  default `±25%`) and that `observed_prompt_tokens <= requested_context_tokens`.
-  Out-of-tolerance or over-budget rows set `prompt_token_mismatch=true`.
+  `prompt_tokens_verified`, `prompt_size_basis`, and `observed_output_tokens`.
+  When the server reports `usage.prompt_tokens`, the benchmark verifies both
+  relative tolerance (`--prompt-token-tolerance`, default `±25%`) and that
+  `observed_prompt_tokens <= requested_context_tokens`. Out-of-tolerance or
+  over-budget rows set `prompt_token_mismatch=true` and
+  `prompt_tokens_verified=false`.
+- **Missing server token usage (fail-closed by default)**: if an endpoint omits
+  `usage.prompt_tokens` (so `observed_prompt_tokens` is `null`), streaming
+  latency and throughput are still measured and displayed in the report/census,
+  but the run is marked `prompt_tokens_verified=false` with
+  `prompt_size_basis="heuristic_estimate"`, disqualified from verified safe
+  context recommendations (`missing_prompt_token_usage`), and labeled with a
+  `~` approximate size marker and `UNVERIFIED` status. Pass
+  `--allow-unverified-usage` only if you explicitly want an opt-in recommendation
+  based on heuristic prompt sizes — such recommendations are still explicitly
+  tagged `unverified` (`OK (unverified)` / `recommendation_status="unverified"`).
 - **Cold vs. warm sweeps (`--cache-mode`)**:
   - `cold` (default) prepends a unique `[Benchmark Request ID: ...]` nonce to
     each iteration's prompt so prefix KV caches cannot mask true prefill latency.
@@ -85,12 +97,15 @@ table. However, a context tier can only qualify for `recommended_context` when:
 
 1. It has at least one qualifying `completed` run with measurable positive
    streaming decode TPS (`avg_tps > 0`).
-2. It has zero `length_limited` (truncated) and zero `prompt_token_mismatch`
+2. It has verified server `usage.prompt_tokens` within tolerance (`prompt_tokens_verified=true`,
+   zero `missing_prompt_token_usage` runs) — unless `--allow-unverified-usage` is
+   explicitly passed, in which case the tier and recommendation are tagged `unverified`.
+3. It has zero `length_limited` (truncated) and zero `prompt_token_mismatch`
    runs.
-3. Its `avg_tps` drops by no more than `15%` from the first qualifying baseline
-   tier (unmeasurable or zero-output rows never establish or disable the
-   baseline).
-4. Measured local host page-outs do not exceed `100` (when host swap telemetry
+4. Its `avg_tps` drops by no more than `15%` from the first qualifying baseline
+   tier (unmeasurable, unverified, or zero-output rows never establish or disable
+   the verified baseline).
+5. Measured local host page-outs do not exceed `100` (when host swap telemetry
    is unavailable, the recommendation explicitly notes that swap pressure was
    not verified).
 
@@ -179,8 +194,12 @@ records.
 
 - **Heuristic prompt sizing**: filler prompts use a `3.5 chars/token` heuristic
   for repeated English technical prose. Actual token counts vary by tokenizer;
-  rely on `observed_prompt_tokens` (from server `usage`) and the tolerance gate
-  to confirm requested vs. actual prompt sizes.
+  by default, a tier cannot qualify as a verified safe context recommendation
+  unless the server returns `usage.prompt_tokens` within tolerance. When a
+  server omits `usage.prompt_tokens`, streaming performance is still reported
+  under an approximate (`~`) size label with `UNVERIFIED` status unless
+  `--allow-unverified-usage` is explicitly passed (in which case any resulting
+  recommendation is still tagged `unverified`).
 - **Client-side timing**: `client_ttft_s` includes network and queueing latency
   in addition to server prefill. For pure server-side prefill timing, pair with
   engine telemetry.

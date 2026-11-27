@@ -886,6 +886,9 @@ class TestSyntheticMockSSEDemo(unittest.TestCase):
 
         # Recommendation lands cleanly on 8K
         self.assertEqual(saved["recommendation"]["recommended_context"], "8K")
+        self.assertTrue(saved["recommendation"]["recommended_context_verified"])
+        self.assertEqual(saved["recommendation"]["recommendation_status"], "verified")
+        self.assertFalse(saved["recommendation"]["unverified"])
         self.assertEqual(saved["config"]["cache_mode"], "cold")
         self.assertTrue(saved["config"]["endpoint_is_local"])
         self.assertEqual(
@@ -893,6 +896,421 @@ class TestSyntheticMockSSEDemo(unittest.TestCase):
             "macos_counters_unavailable",
         )
         self.assertIn("RECOMMENDATION: 8K context window", buf.getvalue())
+
+
+class TestCB05UnverifiedPromptUsageGating(unittest.TestCase):
+    def test_stream_without_usage_block_never_qualifies_verified_recommendation(self):
+        """CB03/CB05 counterexample: 2 nonempty frames + stop, no usage -> disqualified."""
+        lines = _sse_lines(
+            [
+                _delta(content="Normal streamed "),
+                _delta(content="completion without usage."),
+                {"choices": [{"delta": {}, "finish_reason": "stop"}]},
+            ],
+            include_done=True,
+        )
+        clock = _SequenceClock([0.0, 0.2, 0.7, 0.8])
+        fake_httpx = types.SimpleNamespace(
+            Client=_ScriptedClientFactory([_FakeResponse(lines)]),
+            Timeout=lambda *a, **k: None,
+            TimeoutException=TimeoutError,
+        )
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            results_path = Path(tmpdir) / "no-usage.json"
+            buf = io.StringIO()
+            with (
+                mock.patch.object(cb, "httpx", fake_httpx),
+                mock.patch.object(cb.time, "monotonic", side_effect=clock),
+                mock.patch.object(cb, "get_pageout_count", return_value=0),
+                mock.patch.object(cb, "get_memory_pressure", return_value=80),
+                redirect_stdout(buf),
+            ):
+                payload = cb.run_benchmark(
+                    "http://127.0.0.1:8090/v1",
+                    iterations=1,
+                    context_sizes=[4096],
+                    model_name="no-usage-model",
+                    results_file=results_path,
+                )
+
+        raw = payload["raw"][0]
+        self.assertEqual(raw["run_status"], "completed")
+        self.assertIsNone(raw["observed_prompt_tokens"])
+        self.assertFalse(raw["prompt_tokens_verified"])
+        self.assertEqual(raw["prompt_size_basis"], "heuristic_estimate")
+        self.assertTrue(raw["decode_tps_measurable"])
+        self.assertGreater(raw["tokens_per_sec"], 0)
+        self.assertFalse(raw["qualifies_for_recommendation"])
+        self.assertFalse(raw["qualifies_for_verified_recommendation"])
+        self.assertIn("missing_prompt_token_usage", raw["disqualification_reasons"])
+
+        s4 = payload["summary"]["4K"]
+        self.assertEqual(s4["total_runs"], 1)
+        self.assertEqual(s4["runs"], 1)
+        self.assertEqual(s4["qualifying_runs"], 0)
+        self.assertEqual(s4["excluded_runs"], 1)
+        self.assertIsNone(s4["observed_prompt_tokens_avg"])
+        self.assertFalse(s4["prompt_tokens_verified"])
+        self.assertEqual(s4["prompt_size_basis"], "heuristic_estimate")
+        self.assertEqual(s4["cohorts"]["missing_prompt_token_usage"], 1)
+        self.assertIsNotNone(s4["avg_tps"])
+        self.assertEqual(s4["status"], "UNVERIFIED")
+        self.assertFalse(s4["qualifies"])
+        self.assertFalse(s4["verified"])
+
+        rec = payload["recommendation"]
+        self.assertIsNone(rec["recommended_context"])
+        self.assertFalse(rec["recommended_context_verified"])
+        self.assertEqual(rec["recommendation_status"], "none")
+        self.assertFalse(rec["allow_unverified_usage"])
+        self.assertEqual(rec["unverified_tiers"], ["4K"])
+        self.assertIn("usage.prompt_tokens", rec["note"])
+
+        out_text = buf.getvalue()
+        self.assertIn("UNVERIFIED_SIZE(est~3584)", out_text)
+        self.assertIn("~4K", out_text)
+        self.assertIn("unverif", out_text)
+        self.assertIn("UNVERIFIED", out_text)
+        self.assertIn("missing_prompt_token_usage=1", out_text)
+        self.assertIn("RECOMMENDATION: None", out_text)
+
+    def test_usage_with_only_completion_tokens_still_disqualifies_missing_prompt_usage(self):
+        """A usage object missing prompt_tokens (or with prompt_tokens=None) cannot qualify."""
+        for usage_obj in (
+            {"completion_tokens": 12},
+            {"completion_tokens": 12, "prompt_tokens": None},
+            {"completion_tokens": 12, "prompt_tokens": "3584"},
+            {"completion_tokens": 12, "prompt_tokens": True},
+        ):
+            lines = _sse_lines(
+                [
+                    _delta(content="part 1 "),
+                    _delta(content="part 2"),
+                    {"choices": [{"delta": {}, "finish_reason": "stop"}]},
+                    {"choices": [], "usage": usage_obj},
+                ],
+                include_done=True,
+            )
+            clock = _SequenceClock([0.0, 0.2, 0.7, 0.8])
+            fake_httpx = types.SimpleNamespace(
+                Client=_ScriptedClientFactory([_FakeResponse(lines)]),
+                Timeout=lambda *a, **k: None,
+                TimeoutException=TimeoutError,
+            )
+            with (
+                mock.patch.object(cb, "httpx", fake_httpx),
+                mock.patch.object(cb.time, "monotonic", side_effect=clock),
+            ):
+                r = cb.run_single_test(
+                    [{"role": "user", "content": "x"}],
+                    "4K",
+                    "m",
+                    requested_context_tokens=4096,
+                    requested_prompt_tokens=3584,
+                )
+            self.assertIsNone(r["observed_prompt_tokens"], msg=f"usage={usage_obj}")
+            self.assertFalse(r["prompt_tokens_verified"], msg=f"usage={usage_obj}")
+            self.assertFalse(
+                r["qualifies_for_recommendation"], msg=f"usage={usage_obj}"
+            )
+            self.assertIn(
+                "missing_prompt_token_usage",
+                r["disqualification_reasons"],
+                msg=f"usage={usage_obj}",
+            )
+
+    def test_verified_usage_within_tolerance_still_qualifies(self):
+        """Explicit server usage.prompt_tokens within tolerance qualifies cleanly."""
+        lines = _sse_lines(
+            [
+                _delta(content="Verified "),
+                _delta(content="streamed answer."),
+                {"choices": [{"delta": {}, "finish_reason": "stop"}]},
+                {
+                    "choices": [],
+                    "usage": {"completion_tokens": 20, "prompt_tokens": 3600},
+                },
+            ],
+            include_done=True,
+        )
+        clock = _SequenceClock([0.0, 0.2, 0.7, 0.8])
+        fake_httpx = types.SimpleNamespace(
+            Client=_ScriptedClientFactory([_FakeResponse(lines)]),
+            Timeout=lambda *a, **k: None,
+            TimeoutException=TimeoutError,
+        )
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            results_path = Path(tmpdir) / "verified.json"
+            buf = io.StringIO()
+            with (
+                mock.patch.object(cb, "httpx", fake_httpx),
+                mock.patch.object(cb.time, "monotonic", side_effect=clock),
+                mock.patch.object(cb, "get_pageout_count", return_value=0),
+                mock.patch.object(cb, "get_memory_pressure", return_value=80),
+                redirect_stdout(buf),
+            ):
+                payload = cb.run_benchmark(
+                    "http://127.0.0.1:8090/v1",
+                    iterations=1,
+                    context_sizes=[4096],
+                    model_name="verified-model",
+                    results_file=results_path,
+                )
+
+        raw = payload["raw"][0]
+        self.assertEqual(raw["observed_prompt_tokens"], 3600)
+        self.assertTrue(raw["prompt_tokens_verified"])
+        self.assertEqual(raw["prompt_size_basis"], "server_usage")
+        self.assertTrue(raw["prompt_tokens_within_tolerance"])
+        self.assertFalse(raw["prompt_token_mismatch"])
+        self.assertTrue(raw["qualifies_for_recommendation"])
+        self.assertTrue(raw["qualifies_for_verified_recommendation"])
+        self.assertEqual(raw["disqualification_reasons"], [])
+
+        s4 = payload["summary"]["4K"]
+        self.assertEqual(s4["status"], "OK")
+        self.assertTrue(s4["qualifies"])
+        self.assertTrue(s4["verified"])
+        self.assertTrue(s4["prompt_tokens_verified"])
+        self.assertEqual(s4["cohorts"]["missing_prompt_token_usage"], 0)
+
+        rec = payload["recommendation"]
+        self.assertEqual(rec["recommended_context"], "4K")
+        self.assertTrue(rec["recommended_context_verified"])
+        self.assertEqual(rec["recommendation_status"], "verified")
+        self.assertFalse(rec["unverified"])
+        self.assertIn("RECOMMENDATION: 4K context window", buf.getvalue())
+        self.assertNotIn("~4K", buf.getvalue())
+
+    def test_opt_in_allow_unverified_usage_tags_recommendation_unverified(self):
+        """Opt-in allow_unverified_usage permits recommendation ONLY with explicit unverified tags."""
+        lines = _sse_lines(
+            [
+                _delta(content="Streamed "),
+                _delta(content="without usage."),
+                {"choices": [{"delta": {}, "finish_reason": "stop"}]},
+            ],
+            include_done=True,
+        )
+        clock = _SequenceClock([0.0, 0.2, 0.7, 0.8])
+        fake_httpx = types.SimpleNamespace(
+            Client=_ScriptedClientFactory([_FakeResponse(lines)]),
+            Timeout=lambda *a, **k: None,
+            TimeoutException=TimeoutError,
+        )
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            results_path = Path(tmpdir) / "optin-unverified.json"
+            buf = io.StringIO()
+            with (
+                mock.patch.object(cb, "httpx", fake_httpx),
+                mock.patch.object(cb.time, "monotonic", side_effect=clock),
+                mock.patch.object(cb, "get_pageout_count", return_value=0),
+                mock.patch.object(cb, "get_memory_pressure", return_value=80),
+                redirect_stdout(buf),
+            ):
+                payload = cb.run_benchmark(
+                    "http://127.0.0.1:8090/v1",
+                    iterations=1,
+                    context_sizes=[4096],
+                    model_name="no-usage-model",
+                    results_file=results_path,
+                    allow_unverified_usage=True,
+                )
+
+        raw = payload["raw"][0]
+        self.assertIsNone(raw["observed_prompt_tokens"])
+        self.assertFalse(raw["prompt_tokens_verified"])
+        self.assertFalse(raw["qualifies_for_verified_recommendation"])
+        self.assertTrue(raw["qualifies_for_recommendation"])
+        self.assertIn("missing_prompt_token_usage", raw["verification_warnings"])
+
+        s4 = payload["summary"]["4K"]
+        self.assertEqual(s4["status"], "OK (unverified)")
+        self.assertTrue(s4["qualifies"])
+        self.assertFalse(s4["verified"])
+        self.assertFalse(s4["prompt_tokens_verified"])
+
+        rec = payload["recommendation"]
+        self.assertEqual(rec["recommended_context"], "4K")
+        self.assertFalse(rec["recommended_context_verified"])
+        self.assertEqual(rec["recommendation_status"], "unverified")
+        self.assertTrue(rec["unverified"])
+        self.assertTrue(rec["allow_unverified_usage"])
+        self.assertIn("UNVERIFIED", rec["note"])
+
+        out_text = buf.getvalue()
+        self.assertIn("~4K", out_text)
+        self.assertIn("OK (unverified)", out_text)
+        self.assertIn("[UNVERIFIED", out_text)
+
+    def test_mixed_verified_and_unverified_tiers_and_baseline_isolation(self):
+        """Unverified 4K must not establish verified baseline or qualify; verified 8K qualifies."""
+        unverified_4k = _FakeResponse(
+            _sse_lines(
+                [
+                    _delta(content="fast "),
+                    _delta(content="unverified"),
+                    {"choices": [{"delta": {}, "finish_reason": "stop"}]},
+                ],
+                include_done=True,
+            )
+        )
+        verified_8k = _FakeResponse(
+            _sse_lines(
+                [
+                    _delta(content="verified "),
+                    _delta(content="8k"),
+                    {"choices": [{"delta": {}, "finish_reason": "stop"}]},
+                    {
+                        "choices": [],
+                        "usage": {"completion_tokens": 100, "prompt_tokens": 7680},
+                    },
+                ],
+                include_done=True,
+            )
+        )
+        verified_16k_slow = _FakeResponse(
+            _sse_lines(
+                [
+                    _delta(content="verified "),
+                    _delta(content="16k"),
+                    {"choices": [{"delta": {}, "finish_reason": "stop"}]},
+                    {
+                        "choices": [],
+                        "usage": {"completion_tokens": 100, "prompt_tokens": 15872},
+                    },
+                ],
+                include_done=True,
+            )
+        )
+        # 4K: 2 tokens / 0.1s = 20 tps (unverified, excluded from baseline)
+        # 8K: 100 tokens / 1.0s = 100 tps (first verified baseline!)
+        # 16K: 100 tokens / 2.0s = 50 tps (-50% drop vs 8K baseline)
+        clock = _SequenceClock(
+            [
+                0.0, 0.1, 0.2, 0.25,
+                1.0, 1.2, 2.2, 2.3,
+                3.0, 3.2, 5.2, 5.3,
+            ]
+        )
+        fake_httpx = types.SimpleNamespace(
+            Client=_ScriptedClientFactory([unverified_4k, verified_8k, verified_16k_slow]),
+            Timeout=lambda *a, **k: None,
+            TimeoutException=TimeoutError,
+        )
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            results_path = Path(tmpdir) / "mixed.json"
+            buf = io.StringIO()
+            with (
+                mock.patch.object(cb, "httpx", fake_httpx),
+                mock.patch.object(cb.time, "monotonic", side_effect=clock),
+                mock.patch.object(cb, "get_pageout_count", return_value=0),
+                mock.patch.object(cb, "get_memory_pressure", return_value=80),
+                redirect_stdout(buf),
+            ):
+                payload = cb.run_benchmark(
+                    "http://127.0.0.1:8090/v1",
+                    iterations=1,
+                    context_sizes=[4096, 8192, 16384],
+                    model_name="mixed-model",
+                    results_file=results_path,
+                )
+
+        self.assertEqual(payload["summary"]["4K"]["status"], "UNVERIFIED")
+        self.assertFalse(payload["summary"]["4K"]["qualifies"])
+        self.assertEqual(payload["summary"]["8K"]["status"], "OK")
+        self.assertTrue(payload["summary"]["8K"]["qualifies"])
+        self.assertEqual(payload["summary"]["16K"]["status"], "-50%")
+        self.assertFalse(payload["summary"]["16K"]["qualifies"])
+        self.assertEqual(payload["recommendation"]["baseline_tps"], 100.0)
+        self.assertEqual(payload["recommendation"]["recommended_context"], "8K")
+        self.assertTrue(payload["recommendation"]["recommended_context_verified"])
+
+    def test_opt_in_allow_unverified_usage_still_rejects_truncation_and_buffered_decode(self):
+        """--allow-unverified-usage must never bypass truncation or single-frame decode gating."""
+        truncated_no_usage = _sse_lines(
+            [
+                _delta(content="cut "),
+                _delta(content="off"),
+                {"choices": [{"delta": {}, "finish_reason": "length"}]},
+            ],
+            include_done=True,
+        )
+        buffered_no_usage = _sse_lines(
+            [
+                _delta(content="single buffered frame"),
+                {"choices": [{"delta": {}, "finish_reason": "stop"}]},
+            ],
+            include_done=True,
+        )
+        clock = _SequenceClock([0.0, 0.1, 0.6, 0.7, 1.0, 1.2, 1.2001])
+        fake_httpx = types.SimpleNamespace(
+            Client=_ScriptedClientFactory(
+                [_FakeResponse(truncated_no_usage), _FakeResponse(buffered_no_usage)]
+            ),
+            Timeout=lambda *a, **k: None,
+            TimeoutException=TimeoutError,
+        )
+        with (
+            mock.patch.object(cb, "httpx", fake_httpx),
+            mock.patch.object(cb.time, "monotonic", side_effect=clock),
+        ):
+            r_trunc = cb.run_single_test(
+                [{"role": "user", "content": "x"}],
+                "4K",
+                "m",
+                requested_context_tokens=4096,
+                requested_prompt_tokens=3584,
+                allow_unverified_usage=True,
+            )
+            r_buf = cb.run_single_test(
+                [{"role": "user", "content": "x"}],
+                "8K",
+                "m",
+                requested_context_tokens=8192,
+                requested_prompt_tokens=7680,
+                allow_unverified_usage=True,
+            )
+
+        self.assertFalse(r_trunc["qualifies_for_recommendation"])
+        self.assertIn("length_limited", r_trunc["disqualification_reasons"])
+        self.assertFalse(r_buf["qualifies_for_recommendation"])
+        self.assertIn("buffered_single_frame", r_buf["disqualification_reasons"])
+
+    def test_evaluate_summary_fail_closed_when_prompt_tokens_verified_false(self):
+        """Even if a caller constructs a summary row with qualifying_runs=1, fail closed."""
+        summary = {
+            "4K": {
+                "context_size": 4096,
+                "runs": 1,
+                "qualifying_runs": 1,
+                "avg_tps": 80.0,
+                "avg_host_pageouts": 0.0,
+                "prompt_tokens_verified": False,
+                "cohorts": {"missing_prompt_token_usage": 1},
+            }
+        }
+        ev = cb.evaluate_summary(summary, allow_unverified_usage=False)
+        self.assertIsNone(ev["recommended_context"])
+        self.assertEqual(ev["rows"]["4K"]["status"], "UNVERIFIED")
+        self.assertFalse(ev["rows"]["4K"]["qualifies"])
+
+        ev_opt = cb.evaluate_summary(summary, allow_unverified_usage=True)
+        self.assertEqual(ev_opt["recommended_context"], "4K")
+        self.assertFalse(ev_opt["recommended_context_verified"])
+        self.assertTrue(ev_opt["unverified"])
+        self.assertEqual(ev_opt["rows"]["4K"]["status"], "OK (unverified)")
+
+    def test_cli_allow_unverified_usage_flag_defaults_false_and_opts_in(self):
+        parser = cb.build_arg_parser()
+        default_args = parser.parse_args([])
+        self.assertFalse(default_args.allow_unverified_usage)
+        opt_in_args = parser.parse_args(["--allow-unverified-usage"])
+        self.assertTrue(opt_in_args.allow_unverified_usage)
 
 
 if __name__ == "__main__":

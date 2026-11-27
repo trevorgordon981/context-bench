@@ -215,6 +215,31 @@ def _open_stream(client, url, body, request_id):
     return client.stream("POST", url, json=body)
 
 
+def _parse_token_count(value):
+    """Return a non-negative int token count from server usage, or None."""
+    if isinstance(value, bool) or not isinstance(value, int):
+        return None
+    if value < 0:
+        return None
+    return value
+
+
+def _is_missing_prompt_usage(record):
+    """Return True if a run record is missing verified server prompt token usage."""
+    if "missing_prompt_token_usage" in (record.get("disqualification_reasons") or []):
+        return True
+    if "missing_prompt_token_usage" in (record.get("verification_warnings") or []):
+        return True
+    if "prompt_tokens_verified" in record:
+        return (
+            record["prompt_tokens_verified"] is False
+            and record.get("observed_prompt_tokens") is None
+        )
+    if "observed_prompt_tokens" in record:
+        return record["observed_prompt_tokens"] is None
+    return False
+
+
 def _error_result(
     error_message,
     *,
@@ -230,7 +255,9 @@ def _error_result(
         "error": error_message,
         "run_status": "error",
         "qualifies_for_recommendation": False,
+        "qualifies_for_verified_recommendation": False,
         "disqualification_reasons": ["error"],
+        "verification_warnings": [],
         "ttft_s": None,
         "client_ttft_s": None,
         "total_s": None,
@@ -240,6 +267,8 @@ def _error_result(
         "requested_context_tokens": requested_context_tokens,
         "requested_prompt_tokens": requested_prompt_tokens,
         "observed_prompt_tokens": None,
+        "prompt_tokens_verified": False,
+        "prompt_size_basis": "heuristic_estimate",
         "prompt_token_ratio": None,
         "prompt_tokens_within_tolerance": None,
         "prompt_token_mismatch": False,
@@ -275,6 +304,7 @@ def run_single_test(
     cache_mode="cold",
     prompt_token_tolerance=PROMPT_TOKEN_TOLERANCE,
     min_decode_interval_s=MIN_DECODE_INTERVAL_S,
+    allow_unverified_usage=False,
 ):
     """Send a streaming request and measure client-observed prefill/decode behaviour.
 
@@ -293,7 +323,11 @@ def run_single_test(
       * `run_status`: distinguishes `completed`, `length_limited`, `no_output`,
         `incomplete`, `other_finish`, and `error`.
       * Requested vs server-reported `usage.prompt_tokens` are compared against
-        `prompt_token_tolerance` and `requested_context_tokens`.
+        `prompt_token_tolerance` and `requested_context_tokens`. When the server
+        omits `usage.prompt_tokens`, `prompt_tokens_verified` is False and the
+        run is disqualified (`missing_prompt_token_usage`) unless
+        `allow_unverified_usage=True` is explicitly opted in (still tagged
+        unverified).
     """
     req_output_tokens = (
         OUTPUT_TOKENS if requested_output_tokens is None else requested_output_tokens
@@ -400,16 +434,16 @@ def run_single_test(
 
     # Server-reported counts are authoritative when present; chunk counts are fallback.
     chunk_total = content_chunks + reasoning_chunks
-    usage_completion_tokens = (
+    usage_completion_tokens = _parse_token_count(
         usage.get("completion_tokens") if isinstance(usage, dict) else None
     )
-    usage_prompt_tokens = (
+    usage_prompt_tokens = _parse_token_count(
         usage.get("prompt_tokens") if isinstance(usage, dict) else None
     )
     prompt_tokens_details = (
         usage.get("prompt_tokens_details") if isinstance(usage, dict) else None
     )
-    cached_prompt_tokens = (
+    cached_prompt_tokens = _parse_token_count(
         prompt_tokens_details.get("cached_tokens")
         if isinstance(prompt_tokens_details, dict)
         else None
@@ -496,7 +530,22 @@ def run_single_test(
         )
         prompt_token_mismatch = not prompt_tokens_within_tolerance
 
+    # Prompt token count is only verified when the server returns a positive
+    # usage.prompt_tokens count that passes budget/tolerance checks (when
+    # requested_prompt_tokens is known).
+    missing_prompt_usage = (
+        usage_prompt_tokens is None
+        or (usage_prompt_tokens == 0 and not prompt_token_mismatch)
+    )
+    prompt_tokens_verified = (
+        not missing_prompt_usage and not prompt_token_mismatch
+    )
+    prompt_size_basis = (
+        "server_usage" if usage_prompt_tokens is not None else "heuristic_estimate"
+    )
+
     disqualification_reasons = []
+    verification_warnings = []
     if run_status != "completed":
         disqualification_reasons.append(run_status)
     if (
@@ -507,17 +556,27 @@ def run_single_test(
         disqualification_reasons.append("truncated")
     if prompt_token_mismatch:
         disqualification_reasons.append("prompt_token_mismatch")
+    if missing_prompt_usage and error_msg is None:
+        if allow_unverified_usage:
+            verification_warnings.append("missing_prompt_token_usage")
+        else:
+            disqualification_reasons.append("missing_prompt_token_usage")
     if not decode_tps_measurable:
         disqualification_reasons.append(
             decode_tps_exclusion_reason or "unmeasurable_decode_tps"
         )
     qualifies_for_recommendation = len(disqualification_reasons) == 0
+    qualifies_for_verified_recommendation = (
+        qualifies_for_recommendation and prompt_tokens_verified
+    )
 
     rounded_ttft = round(ttft, 3) if ttft is not None else None
     out = {
         "run_status": run_status,
         "qualifies_for_recommendation": qualifies_for_recommendation,
+        "qualifies_for_verified_recommendation": qualifies_for_verified_recommendation,
         "disqualification_reasons": disqualification_reasons,
+        "verification_warnings": verification_warnings,
         "ttft_s": rounded_ttft,
         "client_ttft_s": rounded_ttft,
         "total_s": round(total_time, 3),
@@ -533,6 +592,8 @@ def run_single_test(
         "observed_prompt_tokens": (
             int(usage_prompt_tokens) if usage_prompt_tokens is not None else None
         ),
+        "prompt_tokens_verified": prompt_tokens_verified,
+        "prompt_size_basis": prompt_size_basis,
         "prompt_token_ratio": prompt_token_ratio,
         "prompt_tokens_within_tolerance": prompt_tokens_within_tolerance,
         "prompt_token_mismatch": prompt_token_mismatch,
@@ -594,13 +655,15 @@ def summarize_context_runs(ctx_size, iter_results, requested_prompt_tokens=None)
         and not r.get("prompt_token_mismatch")
         and not r.get("error")
     ]
-    qualifying = [
+    decode_measured = [
         r
         for r in completed_normal
-        if r.get("qualifies_for_recommendation")
-        and r.get("decode_tps_measurable")
+        if r.get("decode_tps_measurable")
         and r.get("tokens_per_sec") is not None
         and r.get("tokens_per_sec") > 0
+    ]
+    qualifying = [
+        r for r in decode_measured if r.get("qualifies_for_recommendation")
     ]
 
     length_limited = [r for r in iter_results if r.get("run_status") == "length_limited"]
@@ -609,7 +672,32 @@ def summarize_context_runs(ctx_size, iter_results, requested_prompt_tokens=None)
     error_runs = [r for r in iter_results if r.get("run_status") == "error"]
     other_finish = [r for r in iter_results if r.get("run_status") == "other_finish"]
     token_mismatch = [r for r in iter_results if r.get("prompt_token_mismatch")]
+    missing_prompt_usage = [
+        r
+        for r in iter_results
+        if not r.get("error") and _is_missing_prompt_usage(r)
+    ]
+    verified_prompt_runs = [
+        r
+        for r in completed_normal
+        if not _is_missing_prompt_usage(r)
+        and r.get("prompt_tokens_verified", True) is not False
+    ]
     failures = [r for r in iter_results if r.get("error")]
+
+    observed_prompt_avg = _avg(
+        [r.get("observed_prompt_tokens") for r in iter_results], ndigits=1
+    )
+    prompt_tokens_verified = (
+        len(missing_prompt_usage) == 0
+        and len(token_mismatch) == 0
+        and len(verified_prompt_runs) > 0
+    )
+    prompt_size_basis = (
+        "server_usage"
+        if (observed_prompt_avg is not None and len(missing_prompt_usage) == 0)
+        else "heuristic_estimate"
+    )
 
     decode_exclusions = Counter(
         r["decode_tps_exclusion_reason"]
@@ -651,11 +739,13 @@ def summarize_context_runs(ctx_size, iter_results, requested_prompt_tokens=None)
             if requested_prompt_tokens is not None
             else ctx_size - OUTPUT_TOKENS
         ),
-        "observed_prompt_tokens_avg": _avg(
-            [r.get("observed_prompt_tokens") for r in iter_results], ndigits=1
-        ),
+        "observed_prompt_tokens_avg": observed_prompt_avg,
+        "prompt_tokens_verified": prompt_tokens_verified,
+        "prompt_size_basis": prompt_size_basis,
+        "verified_prompt_runs": len(verified_prompt_runs),
+        "unverified_prompt_runs": len(missing_prompt_usage),
         "avg_ttft_s": _avg([r.get("ttft_s") for r in completed_normal], 3),
-        "avg_tps": _avg([r.get("tokens_per_sec") for r in qualifying], 2),
+        "avg_tps": _avg([r.get("tokens_per_sec") for r in decode_measured], 2),
         "avg_e2e_tps": _avg(
             [r.get("end_to_end_tokens_per_sec") for r in completed_normal], 2
         ),
@@ -667,8 +757,8 @@ def summarize_context_runs(ctx_size, iter_results, requested_prompt_tokens=None)
         "qualifying_runs": len(qualifying),
         "excluded_runs": len(iter_results) - len(qualifying),
         "failures": len(failures),
-        "decode_tps_measured_runs": len(qualifying),
-        "decode_tps_excluded_runs": len(iter_results) - len(qualifying),
+        "decode_tps_measured_runs": len(decode_measured),
+        "decode_tps_excluded_runs": len(iter_results) - len(decode_measured),
         "decode_tps_exclusions": dict(decode_exclusions),
         "cohorts": {
             "completed": len(completed_normal),
@@ -679,21 +769,27 @@ def summarize_context_runs(ctx_size, iter_results, requested_prompt_tokens=None)
             "error": len(error_runs),
             "other_finish": len(other_finish),
             "token_mismatch": len(token_mismatch),
+            "missing_prompt_token_usage": len(missing_prompt_usage),
         },
         "truncated_cohort": truncated_cohort,
     }
 
 
-def evaluate_summary(results):
+def evaluate_summary(results, *, allow_unverified_usage=False):
     """Evaluate summary rows and determine the safe context-window recommendation.
 
-    Only rows with strictly positive measurable decode TPS, no prompt-token
-    mismatch, no length truncation, no swap pressure, and <= 15% decode TPS drop
-    from the first qualifying baseline can qualify as a recommended safe context.
+    Only rows with strictly positive measurable decode TPS, verified server
+    `usage.prompt_tokens` within tolerance (unless `allow_unverified_usage=True`
+    is explicitly requested, in which case recommendations are clearly tagged
+    `unverified`), no length truncation, no swap pressure, and <= 15% decode TPS
+    drop from the first qualifying baseline can qualify as a recommended safe
+    context.
     """
     baseline_tps = None
     recommended = None
+    recommended_verified = False
     swap_telemetry_available = False
+    unverified_tiers = []
     row_evaluations = {}
 
     for label, data in results.items():
@@ -704,15 +800,30 @@ def evaluate_summary(results):
         if avg_pageouts is not None:
             swap_telemetry_available = True
 
-        if qualifying_runs == 0 or avg_tps is None or avg_tps <= 0:
-            if data.get("runs", 0) > 0 and avg_tps is None:
-                status = "NO_DECODE"
-            elif cohorts.get("token_mismatch", 0) > 0 and cohorts.get("length_limited", 0) > 0:
+        has_missing_usage = cohorts.get("missing_prompt_token_usage", 0) > 0
+        has_unverified_completed = (
+            data.get("runs", 0) > 0 and data.get("prompt_tokens_verified") is False
+        )
+        row_unverified = has_missing_usage or has_unverified_completed
+        if row_unverified:
+            unverified_tiers.append(label)
+
+        if (
+            qualifying_runs == 0
+            or avg_tps is None
+            or avg_tps <= 0
+            or (row_unverified and not allow_unverified_usage)
+        ):
+            if cohorts.get("token_mismatch", 0) > 0 and cohorts.get("length_limited", 0) > 0:
                 status = "TRUNC+SIZE"
             elif cohorts.get("token_mismatch", 0) > 0:
                 status = "SIZE_MISMATCH"
             elif cohorts.get("length_limited", 0) > 0:
                 status = "TRUNCATED"
+            elif data.get("runs", 0) > 0 and avg_tps is None:
+                status = "NO_DECODE"
+            elif row_unverified:
+                status = "UNVERIFIED"
             elif (
                 cohorts.get("no_output", 0) > 0
                 and cohorts.get("incomplete", 0) == 0
@@ -725,6 +836,7 @@ def evaluate_summary(results):
             row_evaluations[label] = {
                 "status": status,
                 "qualifies": False,
+                "verified": not row_unverified,
                 "tps_drop_pct": None,
             }
             continue
@@ -753,35 +865,64 @@ def evaluate_summary(results):
             status = f"-{tps_drop:.0f}%"
             qualifies = False
         else:
-            status = "OK"
+            status = "OK (unverified)" if row_unverified else "OK"
             qualifies = True
             recommended = label
+            recommended_verified = not row_unverified
 
         row_evaluations[label] = {
             "status": status,
             "qualifies": qualifies,
+            "verified": not row_unverified,
             "tps_drop_pct": tps_drop,
         }
 
-    if recommended:
-        swap_note = (
-            "no measured host swap pressure"
-            if swap_telemetry_available
-            else "host swap telemetry unavailable (not verified)"
-        )
+    swap_note = (
+        "no measured host swap pressure"
+        if swap_telemetry_available
+        else "host swap telemetry unavailable (not verified)"
+    )
+    if recommended and recommended_verified:
+        recommendation_status = "verified"
         note = (
-            f"Highest qualifying size with <={TPS_DROP_THRESHOLD_PCT:.0f}% "
-            f"streaming decode TPS drop and {swap_note}."
+            f"Highest verified qualifying size with server-reported prompt_tokens "
+            f"within tolerance, <={TPS_DROP_THRESHOLD_PCT:.0f}% streaming decode TPS "
+            f"drop, and {swap_note}."
+        )
+    elif recommended:
+        recommendation_status = "unverified"
+        note = (
+            f"UNVERIFIED: server omitted usage.prompt_tokens for {recommended}; "
+            f"context size is an approximate heuristic estimate (~{CHARS_PER_TOKEN} "
+            f"chars/token), not a verified token count. Selected only because "
+            f"--allow-unverified-usage was enabled (<={TPS_DROP_THRESHOLD_PCT:.0f}% "
+            f"streaming decode TPS drop and {swap_note})."
         )
     else:
-        note = (
-            "No tested context size met all qualification criteria "
-            "(normal completion, prompt-token tolerance, measurable streaming "
-            "decode TPS, and no swap/throughput cliff)."
-        )
+        recommendation_status = "none"
+        if unverified_tiers:
+            tiers_str = ", ".join(unverified_tiers)
+            note = (
+                f"No tested context size met verified qualification criteria. "
+                f"Server omitted usage.prompt_tokens on tier(s) [{tiers_str}], so "
+                f"actual prompt token counts could not be verified (pass "
+                f"--allow-unverified-usage to opt in to unverified heuristic-size "
+                f"recommendations)."
+            )
+        else:
+            note = (
+                "No tested context size met all qualification criteria "
+                "(normal completion, verified prompt-token tolerance, measurable "
+                "streaming decode TPS, and no swap/throughput cliff)."
+            )
 
     return {
         "recommended_context": recommended,
+        "recommended_context_verified": recommended_verified,
+        "recommendation_status": recommendation_status,
+        "unverified": bool(recommended and not recommended_verified),
+        "allow_unverified_usage": allow_unverified_usage,
+        "unverified_tiers": unverified_tiers,
         "baseline_tps": baseline_tps,
         "tps_drop_threshold_pct": TPS_DROP_THRESHOLD_PCT,
         "swap_pageout_threshold": SWAP_PAGEOUT_THRESHOLD,
@@ -805,6 +946,7 @@ def run_benchmark(
     cache_mode="cold",
     prompt_token_tolerance=PROMPT_TOKEN_TOLERANCE,
     min_decode_interval_s=MIN_DECODE_INTERVAL_S,
+    allow_unverified_usage=False,
 ):
     global API_URL, MODEL_NAME
     API_URL = api_url
@@ -819,7 +961,12 @@ def run_benchmark(
     all_raw = []
     any_host_memory_sampled = False
 
-    print(f"\n{'='*86}")
+    usage_policy = (
+        "unverified allowed (opt-in --allow-unverified-usage)"
+        if allow_unverified_usage
+        else "verified server usage.prompt_tokens required"
+    )
+    print(f"\n{'='*96}")
     print("  Context Window Benchmark")
     print(f"  {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
     print(f"  API: {api_url} ({'local' if endpoint_is_local else 'remote'} endpoint)")
@@ -833,7 +980,8 @@ def run_benchmark(
         f"  Iterations: {iterations}, Output tokens: {OUTPUT_TOKENS}, "
         f"Cache mode: {cache_mode}, Prompt tol: ±{prompt_token_tolerance:.0%}"
     )
-    print(f"{'='*86}\n")
+    print(f"  Prompt size verification: {usage_policy}")
+    print(f"{'='*96}\n")
 
     for ctx_size in context_sizes:
         ctx_label = f"{ctx_size // 1024}K"
@@ -862,6 +1010,7 @@ def run_benchmark(
                 cache_mode=cache_mode,
                 prompt_token_tolerance=prompt_token_tolerance,
                 min_decode_interval_s=min_decode_interval_s,
+                allow_unverified_usage=allow_unverified_usage,
             )
 
             pageouts_after, mem_free_after = sample_host_memory(endpoint_is_local)
@@ -898,6 +1047,10 @@ def run_benchmark(
                     _flags.append(
                         f"SIZE_MISMATCH(obs={result.get('observed_prompt_tokens')})"
                     )
+                if result.get("observed_prompt_tokens") is None:
+                    _flags.append(
+                        f"UNVERIFIED_SIZE(est~{result.get('requested_prompt_tokens')})"
+                    )
                 if not result.get("decode_tps_measurable"):
                     _flags.append(
                         f"DECODE_NA({result.get('decode_tps_exclusion_reason')})"
@@ -933,10 +1086,13 @@ def run_benchmark(
         )
         print()
 
-    evaluation = evaluate_summary(results)
+    evaluation = evaluate_summary(
+        results, allow_unverified_usage=allow_unverified_usage
+    )
     for label, row_eval in evaluation["rows"].items():
         results[label]["status"] = row_eval["status"]
         results[label]["qualifies"] = row_eval["qualifies"]
+        results[label]["verified"] = row_eval["verified"]
         results[label]["tps_drop_pct"] = row_eval["tps_drop_pct"]
 
     if not endpoint_is_local:
@@ -974,11 +1130,18 @@ def run_benchmark(
             "cache_mode": cache_mode,
             "prompt_token_tolerance": prompt_token_tolerance,
             "min_decode_interval_s": min_decode_interval_s,
+            "allow_unverified_usage": allow_unverified_usage,
+            "require_prompt_token_usage": not allow_unverified_usage,
             "think_kwargs": dict(THINK_KWARGS) or None,
             "memory_telemetry": mem_telemetry,
         },
         "recommendation": {
             "recommended_context": evaluation["recommended_context"],
+            "recommended_context_verified": evaluation["recommended_context_verified"],
+            "recommendation_status": evaluation["recommendation_status"],
+            "unverified": evaluation["unverified"],
+            "allow_unverified_usage": evaluation["allow_unverified_usage"],
+            "unverified_tiers": evaluation["unverified_tiers"],
             "baseline_tps": evaluation["baseline_tps"],
             "tps_drop_threshold_pct": evaluation["tps_drop_threshold_pct"],
             "swap_pageout_threshold": evaluation["swap_pageout_threshold"],
@@ -992,23 +1155,33 @@ def run_benchmark(
     print(f"Raw results saved to {results_file}\n")
 
     # Summary table
-    print(f"{'='*86}")
+    print(f"{'='*96}")
     print("  SUMMARY")
-    print(f"{'='*86}")
+    print(f"{'='*96}")
     print(
-        f"  {'Context':>7}  {'TTFT':>7}  {'DecTPS':>7}  {'E2ETPS':>7}  "
-        f"{'Total':>7}  {'Pageouts':>8}  {'Qual':>5}  {'Status':>13}"
+        f"  {'Context':>7}  {'ObsIn':>7}  {'TTFT':>7}  {'DecTPS':>7}  {'E2ETPS':>7}  "
+        f"{'Total':>7}  {'Pageouts':>8}  {'Qual':>5}  {'Status':>15}"
     )
     print(
-        f"  {'─'*7}  {'─'*7}  {'─'*7}  {'─'*7}  "
-        f"{'─'*7}  {'─'*8}  {'─'*5}  {'─'*13}"
+        f"  {'─'*7}  {'─'*7}  {'─'*7}  {'─'*7}  {'─'*7}  "
+        f"{'─'*7}  {'─'*8}  {'─'*5}  {'─'*15}"
     )
 
     total_exclusions = Counter()
     total_disqualified_cohorts = Counter()
+    any_unverified_row = False
 
     for label, data in results.items():
         status = data["status"]
+        cohorts = data.get("cohorts") or {}
+        is_unverified_row = cohorts.get("missing_prompt_token_usage", 0) > 0
+        if is_unverified_row:
+            any_unverified_row = True
+        display_label = f"~{label}" if is_unverified_row else label
+        obs_in_empty = "unverif" if is_unverified_row else "—"
+        obs_in_str = _fmt_opt(
+            data.get("observed_prompt_tokens_avg"), "{:.0f}", empty=obs_in_empty
+        )
         qual_str = f"{data['qualifying_runs']}/{data['total_runs']}"
         ttft_str = _fmt_opt(data["avg_ttft_s"], "{:.2f}s")
         dec_empty = "N/A" if data["runs"] > 0 else "—"
@@ -1018,8 +1191,8 @@ def run_benchmark(
         pg_str = _fmt_opt(data["avg_pageouts"], "{:.0f}", empty="N/A")
 
         print(
-            f"  {label:>7}  {ttft_str:>7}  {dec_str:>7}  {e2e_str:>7}  "
-            f"{tot_str:>7}  {pg_str:>8}  {qual_str:>5}  {status:>13}"
+            f"  {display_label:>7}  {obs_in_str:>7}  {ttft_str:>7}  {dec_str:>7}  "
+            f"{e2e_str:>7}  {tot_str:>7}  {pg_str:>8}  {qual_str:>5}  {status:>15}"
         )
 
         total_exclusions.update(data.get("decode_tps_exclusions") or {})
@@ -1030,16 +1203,22 @@ def run_benchmark(
             "error",
             "other_finish",
             "token_mismatch",
+            "missing_prompt_token_usage",
         ):
-            count = (data.get("cohorts") or {}).get(key, 0)
+            count = cohorts.get(key, 0)
             if count:
                 total_disqualified_cohorts[key] += count
 
     print(
-        f"  {'─'*7}  {'─'*7}  {'─'*7}  {'─'*7}  "
-        f"{'─'*7}  {'─'*8}  {'─'*5}  {'─'*13}"
+        f"  {'─'*7}  {'─'*7}  {'─'*7}  {'─'*7}  {'─'*7}  "
+        f"{'─'*7}  {'─'*8}  {'─'*5}  {'─'*15}"
     )
 
+    if any_unverified_row:
+        print(
+            "  Note: '~' context sizes and ObsIn=unverif indicate approximate heuristic "
+            "prompt sizes (server omitted usage.prompt_tokens)."
+        )
     if total_exclusions:
         excl_fmt = ", ".join(f"{k}={v}" for k, v in sorted(total_exclusions.items()))
         print(f"  Decode TPS exclusions: {excl_fmt}")
@@ -1054,10 +1233,19 @@ def run_benchmark(
     # Recommendation
     print()
     if evaluation["recommended_context"]:
-        print(f"  RECOMMENDATION: {evaluation['recommended_context']} context window")
+        if evaluation["recommended_context_verified"]:
+            print(f"  RECOMMENDATION: {evaluation['recommended_context']} context window")
+        else:
+            print(
+                f"  RECOMMENDATION: ~{evaluation['recommended_context']} context window "
+                "[UNVERIFIED — missing server usage.prompt_tokens]"
+            )
         print(f"  {evaluation['note']}")
     else:
-        print("  RECOMMENDATION: None — no tested context size met qualification criteria.")
+        print(
+            "  RECOMMENDATION: None — no tested context size met verified "
+            "qualification criteria."
+        )
         print(f"  {evaluation['note']}")
     print()
     return output
@@ -1262,6 +1450,7 @@ def run_demo(
     iterations=1,
     context_sizes=None,
     cache_mode="cold",
+    allow_unverified_usage=False,
 ):
     """Run an offline end-to-end synthetic mock-SSE benchmark demo."""
     sizes = context_sizes or [4096, 8192, 16384, 32768, 65536]
@@ -1274,13 +1463,14 @@ def run_demo(
             model_name="synthetic-mock-sse",
             results_file=results_file,
             cache_mode=cache_mode,
+            allow_unverified_usage=allow_unverified_usage,
         )
     finally:
         server.shutdown()
         server.server_close()
 
 
-if __name__ == "__main__":
+def build_arg_parser():
     parser = argparse.ArgumentParser(description="Local LLM context window benchmark")
     parser.add_argument(
         "--api-url", default=API_URL, help=f"API base URL (default: {API_URL})"
@@ -1331,6 +1521,14 @@ if __name__ == "__main__":
         f"to publish streaming decode TPS (default: {MIN_DECODE_INTERVAL_S})",
     )
     parser.add_argument(
+        "--allow-unverified-usage",
+        action="store_true",
+        default=False,
+        help="Opt in to allowing tiers where the server omitted usage.prompt_tokens "
+        "to qualify for an explicitly tagged UNVERIFIED recommendation based on "
+        "heuristic prompt sizing (~3.5 chars/token). Off by default.",
+    )
+    parser.add_argument(
         "--think",
         choices=["on", "off"],
         default=None,
@@ -1359,6 +1557,11 @@ if __name__ == "__main__":
         "mock-SSE server covering streamed, buffered, truncated/mismatched, "
         "and degraded context tiers.",
     )
+    return parser
+
+
+if __name__ == "__main__":
+    parser = build_arg_parser()
     args = parser.parse_args()
 
     if args.think_kwargs:
@@ -1379,6 +1582,7 @@ if __name__ == "__main__":
             iterations=args.iterations if args.iterations is not None else 1,
             context_sizes=sizes,
             cache_mode=args.cache_mode,
+            allow_unverified_usage=args.allow_unverified_usage,
         )
     else:
         run_benchmark(
@@ -1390,4 +1594,5 @@ if __name__ == "__main__":
             cache_mode=args.cache_mode,
             prompt_token_tolerance=args.prompt_token_tolerance,
             min_decode_interval_s=args.min_decode_interval,
+            allow_unverified_usage=args.allow_unverified_usage,
         )
