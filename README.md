@@ -181,17 +181,21 @@ The kwargs sent are recorded on every result row (`think_kwargs`) and in
 
 ## Usage
 
+**Prerequisite:** **Python >= 3.11** (use `python3.11` explicitly on macOS so stock system Python 3.9 is not selected).
+
 ```bash
+python3.11 -m venv .venv
+source .venv/bin/activate
 pip install -r requirements.txt
 
 # Offline synthetic mock-SSE demo (no LLM server required)
-python3 context-bench.py --demo
+python context-bench.py --demo
 
 # Default: hits http://127.0.0.1:8090/v1, model "default", 3 cold iterations
-python3 context-bench.py
+python context-bench.py
 
 # Point at your endpoint and model with custom sizes and cache mode
-python3 context-bench.py \
+python context-bench.py \
     --api-url http://127.0.0.1:8080/v1 \
     --model my-model-name \
     --sizes 4,8,16,32,64 \
@@ -206,7 +210,7 @@ Run the built-in offline demo to inspect the full report format and gating
 behavior without starting a live inference server:
 
 ```bash
-python3 context-bench.py --demo --results-file /tmp/context-bench-demo.json
+python context-bench.py --demo --results-file /tmp/context-bench-demo.json
 ```
 
 The demo starts a local ephemeral mock OpenAI SSE server on `127.0.0.1` and
@@ -259,9 +263,24 @@ top-level `recommendation` object (`recommended_context`,
 ## Running Tests
 
 ```bash
-python3 test_reasoning_parsing.py
-python3 -m unittest discover -s . -p "test_*.py" -v
+python3.11 -m venv .venv && source .venv/bin/activate
+pip install -r requirements.txt
+python test_reasoning_parsing.py
+python -m unittest discover -s . -p "test_*.py" -v
 ```
+
+## Measured Results
+
+Verified offline in an isolated Python 3.11.14 virtual environment (Apple Silicon macOS / `Darwin arm64`, 2026-11-27):
+
+- **Unit test suite** (`python -m unittest discover -s . -p "test_*.py" -v`): **48/48 passed** in **1.82s** (1.93s wall time), including `test_reasoning_parsing.py` (**5/5 passed**, 0.08s wall time standalone).
+- **Offline synthetic mock-SSE demo** (`python context-bench.py --demo`, 1 cold iteration across 5 synthetic tiers, **1.93s** wall time):
+  - `4K`: ObsIn `3584`, ObsTot `3600`, TTFT `0.04s`, DecTPS `136.5`, E2ETPS `75.4`, Total `0.21s`, Qual `1/1`, Status `OK`
+  - `8K`: ObsIn `7680`, ObsTot `7696`, TTFT `0.06s`, DecTPS `133.6`, E2ETPS `68.7`, Total `0.23s`, Qual `1/1`, Status `OK`
+  - `16K`: ObsIn `15872`, ObsTot `16384`, TTFT `0.09s`, DecTPS `N/A` (`buffered_single_frame`), E2ETPS `5878.0`, Total `0.09s`, Qual `0/1`, Status `NO_DECODE`
+  - `32K`: ObsIn `64512`, ObsTot `65024`, Qual `0/1`, Status `TRUNC+SIZE` (`length_limited`, `token_mismatch`, `TOTAL_OVER`)
+  - `64K`: ObsIn `65024`, ObsTot `65040`, TTFT `0.13s`, DecTPS `62.1`, E2ETPS `31.4`, Total `0.51s`, Qual `1/1`, Status `-54%`
+  - **Recommendation:** `8K` (`verification_scope=verified_prompt_and_total_within_tier`, observed prompt `7680`, observed total `7696 <= 8192`, baseline decode TPS `136.48`, host pageouts `0`).
 
 ## Related Projects
 
